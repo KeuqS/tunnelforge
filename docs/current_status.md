@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-09-29
+Last reviewed: 2026-10-12
 
 Current shipping version: `v2.16.2` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
@@ -855,6 +855,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-10-12 | Quick Start documentation alignment / TF-STATUS-172 | Source inspection of `src/ui/main_window.py`, `src/ui/dialogs/tunnel_config.py`, `src/ui/widgets/tunnel_tree.py`, and `src/core/i18n/keys.py`; direct label assertions for both READMEs; `git diff --check` | Source labels and documentation assertions agree; pytest execution is blocked before collection by the shared fixture because `PyQt6` is not installed in this clone | Focused documentation test was added; rerun `pytest tests\test_build_docs.py -q` after installing project dependencies. |
 | 2026-10-07 | `v2.16.1` protected publication closure | PR #330 protected checks and merge; approved `create-release-tag.yml` run `37576207651`; approved `release.yml` run `37576244244`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `37574681308` and `37574681288` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `ec897c1bf671f01eccd6fba45d12c47e5eda9ad6`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.16.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.16.1`. |
 | 2026-10-07 | `v2.16.0` protected publication closure | PR #326 protected checks and merge; approved `create-release-tag.yml` run `37566887405`; approved `release.yml` run `37566934743`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `37565673754` and `37565673718` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `6af603374539e34ab13bb8b61677db236ba0c97b`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.16.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.16.0`. |
 | 2026-10-07 | `v2.15.1` protected publication closure | PR #321 protected checks and merge; approved `create-release-tag.yml` run `37560990874`; approved `release.yml` run `37561047934`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `37559892230` and `37559892360` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `ef3be38337745d36ec6e2c60ace651b1e9451c73`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.15.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.15.1`. |
@@ -2890,6 +2891,7 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-172 | Low | fixed_pending_full_verify | Quick Start labels (#347) | README.md and README.ko.md now describe the current Add Connection/연결 추가 dialog, SSH/direct modes, Endpoint and DB Port fields, Start/시작 control, context-menu tools and Tools/도구 menu; `tests/test_build_docs.py` rejects the stale Add Tunnel/터널 추가 labels and checks the current names | Install the repository test dependencies and rerun `pytest tests\test_build_docs.py -q`; then refresh this row with the hosted PR result |
 | TF-STATUS-171 | Medium | closed | Settings import port validation (#348) | Importing a settings file now validates `bastion_port` like `local_port` and rejects booleans for every port field, so a malformed import no longer saves a connection whose Edit dialog crashes on `int(bastion_port)`. Regression tests in tests/test_config_manager.py; focused suite 70 passed | None |
 | TF-STATUS-170 | Low | closed | Good-first-issue batch (#335-#338) | CONTRIBUTING.md now describes the real label-driven, maintainer-dispatched release flow and how to run Python/Rust/live tests; update-check errors are fully English in the English UI; schedule descriptions are built per language via tr() keys with zero-padded hours and unsupported cron expressions returned unchanged; UpdateChecker has unit tests with mocked requests. Full pytest 2894 passed, 27 skipped | None |
 | TF-STATUS-169 | Medium | open | Windows code signing | release.yml supports optional free SignPath Foundation signing (no paid certificate, no store/winget): when `vars.SIGNPATH_ORGANIZATION_ID` + `secrets.SIGNPATH_API_TOKEN` are set, TunnelForge.exe/tunnelforge-core.exe/WebSetup are signed before Inno Setup and the Setup exe after it, then verified with Get-AuthenticodeSignature; otherwise releases stay unsigned exactly as before. SignPath Foundation declined the application on 2026-10-07 (not enough public visibility yet); README "Code signing policy" states releases are unsigned and the signing steps stay dormant; macOS stays unsigned beta | Grow public visibility (stars, external articles, discussions) and reapply to SignPath Foundation; on approval set the SignPath vars/secret in `production-release` and verify signatures on the first signed release |
@@ -3075,6 +3077,10 @@ v2.11.1 (TF-STATUS-138) fixed silent export corruption for binary primary keys (
 affected backups taken with <= 2.11.0 must be re-taken.
 Real Mac and managed-provider validation stay deferred by user decision.
 
+The current external documentation follow-up is GitHub #347 / TF-STATUS-172:
+the Quick Start pages are aligned with the current connection dialog and menu
+labels, with the focused test awaiting a dependency-complete test environment.
+
 Current execution priority (2026-09-29):
 
 Use [the execution handoff](handoff_2026-09-29.md) for startup checks, agent
@@ -3219,6 +3225,7 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-10-12 | Investigated GitHub #347 and aligned the English and Korean Quick Start pages with the current connection flow; added regression assertions for stale and current labels. | `README.md`, `README.ko.md`, `tests/test_build_docs.py`, canonical status | Direct source/document checks passed; pytest collection is blocked by missing `PyQt6` in the clone. |
 | 2026-10-02 | Merged #295 (live security gate, 144) and #296, published v2.12.0 (145). The PM agenda items (1)-(4) from this session are shipped; next candidates are the PK-type keyset live matrix, the Python live tests in CI, and doc/README alignment. | Canonical tracker | See the v2.12.0 publication row. |
 | 2026-10-02 | Merged #294 and published v2.11.3 (140). Added the safe-restore-backed overwrite Import mode (143) after a 2-lens review (stale one-shot flag, unlocked radio, audit/operator choice and job labelling fixed). Opened #295 to run TLS/query-control/read-only live tests in the gate. | `src/ui/dialogs/db_import_dialog.py`, `src/core/i18n/legacy_translate.py`, `tests/test_dump_promotion_ui.py`, `docs/export_import_policy.md`, canonical tracker | Full `pytest -q`: 3343 passed / 27 skipped. |
 | 2026-10-02 | Merged #293 and published v2.11.2 (139). Started agenda (2): allowlisted error codes in anonymous Export/Import reports and the preflight-refusal classification fix (140). | `src/core/error_report_codes.py`, `src/core/error_report_builder.py`, `src/ui/workers/{error_reporting_worker,rust_dump_worker}.py`, `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_{import,export}_dialog.py`, tests, `docs/error_reporting.md`, canonical tracker | See the error report codes verification row. |
