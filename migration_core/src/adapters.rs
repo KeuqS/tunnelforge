@@ -786,6 +786,19 @@ pub(crate) fn mysql_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, Strin
     })
 }
 
+/// Raises how many warnings SHOW WARNINGS lists. MySQL 8 requires SESSION_VARIABLES_ADMIN
+/// for this, so an account without it keeps the server default (1024). Every warning check
+/// compares SHOW COUNT(*) WARNINGS with the rows it can see, so a lower cap can only refuse
+/// a statement, never hide a warning.
+// ponytail: a restricted account refuses a chunk with more than 1024 expected legacy ENUM-zero
+// warnings; read @@max_error_count into the batch size if that ever matters.
+pub(crate) fn raise_mysql_max_error_count(conn: &mut mysql::PooledConn) -> Result<(), mysql::Error> {
+    match conn.query_drop("SET SESSION max_error_count=65535") {
+        Err(mysql::Error::MySqlError(err)) if err.code == 1227 => Ok(()),
+        result => result,
+    }
+}
+
 pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
     mysql::OptsBuilder::new()
         // Pools are private to a single worker/adapter; driver defaults would
