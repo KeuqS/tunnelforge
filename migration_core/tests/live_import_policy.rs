@@ -209,6 +209,42 @@ fn mysql_import_modes_preserve_values_across_load_and_insert_paths() {
 }
 
 #[test]
+fn mysql_import_works_for_an_account_without_session_variables_admin() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let (db, user) = (unique("tf_scoped"), "tf_import_scoped");
+    for sql in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        // Database privileges only, like a typical application account.
+        format!("GRANT ALL ON {db}.* TO '{user}'@'%'"),
+        format!("CREATE TABLE {db}.parent (id INT PRIMARY KEY, label VARCHAR(20))"),
+        format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT, FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+        format!("INSERT INTO {db}.parent VALUES (1,'a'),(2,'b')"),
+        format!("INSERT INTO {db}.child VALUES (10,1),(11,2)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let source = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let scoped = Endpoint { user: user.into(), database: db.clone(), ..endpoint.clone() };
+    assert!(connect(&scoped).query_drop("SET SESSION max_error_count=65535").is_err(), "the account must lack SESSION_VARIABLES_ADMIN");
+    let output = std::env::temp_dir().join(unique("tf_scoped"));
+    let exported = run("dump.run", json!({"source": source, "output_dir": output, "threads": 1, "mysql_snapshot_mode": "single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    for mode in ["replace", "recreate", "merge"] {
+        root.query_drop(format!("DELETE FROM {db}.child")).unwrap();
+        root.query_drop(format!("DELETE FROM {db}.parent")).unwrap();
+        let imported = run("dump.import", json!({"target": scoped, "input_dir": output, "mode": mode, "threads": 2}));
+        assert!(success(&imported), "{mode}: {imported:?}");
+        let rows: Vec<(u64, u64)> = root.query(format!("SELECT c.id, p.id FROM {db}.child c JOIN {db}.parent p ON p.id = c.parent_id ORDER BY c.id")).unwrap();
+        assert_eq!(rows, vec![(10, 1), (11, 2)], "{mode}");
+    }
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    root.query_drop(format!("DROP USER '{user}'@'%'")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
 fn mysql_merge_enforces_existing_foreign_keys() {
     let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let Some(endpoint) = endpoint() else { return };

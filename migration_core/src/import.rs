@@ -1499,7 +1499,6 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
-            "SET SESSION max_error_count=65535".to_string(),
             "SET SESSION lc_messages='en_US'".to_string(),
             // 서버 측 세션 idle/전송 타임아웃 상향 — 대량 청크 전송 중 서버가
             // net_read/net_write_timeout(기본 30/60s)이나 wait_timeout으로 먼저
@@ -1517,6 +1516,9 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
     }
     for sql in mysql_import_session_tuning_sql(restore) {
         adapter.execute_sql(&sql)?;
+    }
+    if let (LiveAdapter::MySql(conn), false) = (adapter, restore) {
+        raise_mysql_max_error_count(conn).map_err(|err| format!("mysql SQL execution error: {err}"))?;
     }
     Ok(())
 }
@@ -2307,7 +2309,6 @@ mod tests {
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
-            "SET SESSION max_error_count=65535".to_string(),
             "SET SESSION lc_messages='en_US'".to_string(),
                 "SET SESSION net_read_timeout = 600".to_string(),
                 "SET SESSION net_write_timeout = 600".to_string(),
