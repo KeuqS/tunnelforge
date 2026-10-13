@@ -26,7 +26,8 @@ from src.core.logger import get_logger
 from src.core.path_safety import safe_filename_component, safe_output_dir
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, build_rust_dump_config, check_rust_dump,
-    DEFAULT_DUMP_COMPRESSION, is_mysql_parallel_snapshot_privilege_error,
+    DEFAULT_DUMP_COMPRESSION, MYSQL_PRIVILEGE_LOCK_TABLES,
+    is_mysql_parallel_snapshot_privilege_error,
     mysql_parallel_snapshot_denied_privilege
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
@@ -39,6 +40,40 @@ from src.ui.dialogs.job_recording import begin_export_job, finish_export_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
+
+
+# 권한 안내 버튼 objectName -> (버튼 문구, 다시 시도할 mysql_snapshot_mode)
+_MYSQL_PRIVILEGE_CHOICES = {
+    "mysql_parallel_table_lock_continue": ("병렬로 계속 (테이블 락, 권장)", "parallel_table_lock"),
+    "mysql_parallel_unsynchronized_continue": (
+        "병렬로 계속 (시점 일관성 보장 안 함)", "parallel_unsynchronized"
+    ),
+    "mysql_single_connection_continue": ("단일 연결로 계속", "single_connection"),
+}
+# 재시도 mysql_snapshot_mode -> (실행 로그, 상태 표시)
+_MYSQL_RETRY_MESSAGES = {
+    "parallel_table_lock": (
+        "전역 락 권한 없음: 테이블 읽기 락 공유 스냅샷(병렬)으로 다시 시도합니다.",
+        "테이블 락 공유 스냅샷(병렬)으로 다시 시도 중...",
+    ),
+    "parallel_unsynchronized": (
+        "사용자 선택: 워커별 독립 스냅샷(병렬)으로 다시 시도합니다. "
+        "테이블 간 시점 일관성은 보장되지 않습니다.",
+        "독립 스냅샷(병렬, 시점 일관성 미보장)으로 다시 시도 중...",
+    ),
+    "single_connection": (
+        "병렬 Export 권한 없음: 단일 연결 일관 스냅샷으로 다시 시도합니다.",
+        "단일 연결 일관 스냅샷으로 다시 시도 중...",
+    ),
+}
+_UNSYNCHRONIZED_EXPORT_WARNING = (
+    "워커별 독립 스냅샷으로 내보냈습니다. 테이블 간 시점 일관성이 보장되지 않습니다."
+)
+_INCOMPLETE_EXPORT_WARNING = (
+    "일부 객체를 제외한 불완전 Export입니다. 나머지 테이블의 구조와 데이터는 모두 내보냈으며, "
+    "제외된 객체는 결과 로그와 manifest 경고를 확인하세요."
+)
+_INCOMPLETE_EXPORT_LIST_LIMIT = 10
 
 
 _EXPORT_TELEMETRY_TYPES = {
@@ -307,8 +342,6 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
-        self._mysql_single_connection_fallback = False
-        self._mysql_no_backup_lock_fallback = False
         self._allow_incomplete = False
         self._snapshot_mode = "parallel_strict"
 
@@ -1098,8 +1131,6 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_save_log.setEnabled(False)
         self._cancel_requested = False
         self._close_after_cancel = False
-        self._mysql_single_connection_fallback = False
-        self._mysql_no_backup_lock_fallback = False
         self._allow_incomplete = False
         self._snapshot_mode = "parallel_strict"
 
@@ -1149,105 +1180,71 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         worker.finished.connect(self.on_finished)
         worker.start()
 
-    def _create_mysql_privilege_dialog(
-        self, denied_privilege: Optional[str] = None
-    ) -> QMessageBox:
+    def _create_mysql_privilege_dialog(self, table_lock_denied: bool = False) -> QMessageBox:
         message_box = QMessageBox(self)
         message_box.setIcon(QMessageBox.Icon.Warning)
-        message_box.setWindowTitle("병렬 Export 권한 필요")
-        # 락 없는 모드는 테이블 간 일관성을 위해 단일 워커를 사용한다.
-        # 기존 API 모드와 버튼 식별자는 호환성을 위해 유지한다.
-        can_use_lock_free = denied_privilege is not None
-        if can_use_lock_free:
+        if table_lock_denied:
+            message_box.setWindowTitle("일관 병렬 Export 불가")
             message_box.setText(
-                "병렬 Export에 필요한 락 권한이 없습니다.\n\n"
-                "테이블 간 데이터 일관성을 위해 락 없이 단일 연결·단일 워커로 Export합니다. "
-                "병렬 처리보다 느릴 수 있으며, 덤프 후 스키마 변경(DDL) 여부를 검사합니다."
+                "이 계정은 내보낼 테이블의 LOCK TABLES 권한도 없어, "
+                "모든 워커가 같은 시점을 보는 병렬 Export를 할 수 없습니다.\n\n"
+                "단일 연결로 계속하면 느리지만 모든 테이블을 같은 시점으로 내보냅니다. "
+                "병렬로 계속하면 빠르지만 워커마다 스냅샷 시점이 달라 "
+                "테이블 사이의 데이터가 서로 맞지 않을 수 있습니다.\n\n"
+                "LOCK TABLES 권한이나 전역 권한(RELOAD, BACKUP_ADMIN)을 받으면 "
+                "일관된 병렬 Export를 사용할 수 있습니다."
             )
+            names = [
+                "mysql_single_connection_continue",
+                "mysql_parallel_unsynchronized_continue",
+            ]
         else:
+            message_box.setWindowTitle("병렬 Export 권한 필요")
             message_box.setText(
-                "병렬 Export에 필요한 MySQL 권한이 없습니다.\n\n"
-                "권한 없이 단일 연결로 안전하게 Export할 수 있지만 "
-                "병렬 처리는 사용되지 않습니다."
+                "병렬 일관 스냅샷에 필요한 MySQL 전역 락 권한(RELOAD, BACKUP_ADMIN)이 없습니다.\n\n"
+                "권장 방식은 내보낼 테이블만 잠깐(최대 2초) 잠가 모든 워커가 같은 시점의 "
+                "데이터를 보게 한 뒤 바로 해제합니다. 그동안 해당 테이블의 쓰기는 대기합니다.\n\n"
+                "계정에 전역 권한을 부여하면 다음 Export부터 이 질문 없이 진행합니다."
             )
-
-        parallel_button = None
-        if can_use_lock_free:
-            parallel_button = message_box.addButton(
-                translate_text("락 없이 계속 (단일 워커)"),
+            names = [
+                "mysql_parallel_table_lock_continue",
+                "mysql_parallel_unsynchronized_continue",
+                "mysql_single_connection_continue",
+            ]
+        for name in names:
+            button = message_box.addButton(
+                translate_text(_MYSQL_PRIVILEGE_CHOICES[name][0]),
                 QMessageBox.ButtonRole.AcceptRole,
             )
-            parallel_button.setObjectName("mysql_parallel_no_backup_lock_continue")
-
-        continue_button = message_box.addButton(
-            translate_text("단일 연결로 계속"),
-            QMessageBox.ButtonRole.AcceptRole,
-        )
-        continue_button.setObjectName("mysql_single_connection_continue")
-        guidance_button = message_box.addButton(
-            translate_text("권한 설정 안내"),
-            QMessageBox.ButtonRole.ActionRole,
-        )
-        guidance_button.setObjectName("mysql_privilege_guidance")
+            button.setObjectName(name)
+            if name == names[0]:
+                message_box.setDefaultButton(button)
         cancel_button = message_box.addButton(
             translate_text("취소"),
             QMessageBox.ButtonRole.RejectRole,
         )
         cancel_button.setObjectName("mysql_privilege_cancel")
-        message_box.setDefaultButton(parallel_button or continue_button)
         message_box.setEscapeButton(cancel_button)
         return message_box
 
-    def _prompt_mysql_privilege_action(
-        self, denied_privilege: Optional[str] = None
-    ) -> str:
-        message_box = self._create_mysql_privilege_dialog(denied_privilege)
+    def _prompt_mysql_privilege_action(self, table_lock_denied: bool = False) -> str:
+        """다시 시도할 mysql_snapshot_mode, 또는 "cancel"을 반환한다."""
+        message_box = self._create_mysql_privilege_dialog(table_lock_denied)
         message_box.exec()
         clicked = message_box.clickedButton()
         object_name = clicked.objectName() if clicked is not None else ""
-        return {
-            "mysql_parallel_no_backup_lock_continue": "parallel_no_backup_lock",
-            "mysql_single_connection_continue": "continue",
-            "mysql_privilege_guidance": "guidance",
-        }.get(object_name, "cancel")
+        return _MYSQL_PRIVILEGE_CHOICES.get(object_name, ("", "cancel"))[1]
 
-    def _show_mysql_privilege_guidance(self) -> None:
-        QMessageBox.information(
-            self,
-            "MySQL 병렬 Export 권한 설정",
-            "병렬 일관 스냅샷에는 다음 전역 권한이 필요합니다.\n\n"
-            "• FLUSH_TABLES 또는 RELOAD\n"
-            "• BACKUP_ADMIN\n\n"
-            "DBA에게 해당 권한을 요청한 뒤 Export를 다시 실행하세요.",
-        )
-
-    def _retry_with_single_connection(self) -> None:
-        self._mysql_single_connection_fallback = True
-        self._add_log(
-            "병렬 Export 권한 없음: 단일 연결 일관 스냅샷으로 다시 시도합니다."
-        )
+    def _retry_with_snapshot_mode(self, mysql_snapshot_mode: str) -> None:
+        log_message, status = _MYSQL_RETRY_MESSAGES[mysql_snapshot_mode]
+        self._add_log(log_message)
         self.set_ui_enabled(False)
         self.collapse_config_section()
-        self.label_status.setText("단일 연결 일관 스냅샷으로 다시 시도 중...")
+        self.label_status.setText(status)
         worker = self._build_worker(
             self.export_schema,
             self.input_output_dir.text(),
-            mysql_snapshot_mode="single_connection",
-        )
-        self._start_export_worker(worker)
-
-    def _retry_with_parallel_no_backup_lock(self) -> None:
-        self._mysql_no_backup_lock_fallback = True
-        self._add_log(
-            "락 권한 없음: 데이터 일관성을 위해 락 없는 단일 워커로 다시 시도합니다."
-        )
-        self.set_ui_enabled(False)
-        self.collapse_config_section()
-        self.label_status.setText("락 없는 단일 연결 스냅샷으로 다시 시도 중...")
-        worker = self._build_worker(
-            self.export_schema,
-            self.input_output_dir.text(),
-            mysql_snapshot_mode="parallel_no_backup_lock",
+            mysql_snapshot_mode=mysql_snapshot_mode,
         )
         self._start_export_worker(worker)
 
@@ -1256,15 +1253,23 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         message_box = QMessageBox(self)
         message_box.setIcon(QMessageBox.Icon.Warning)
         message_box.setWindowTitle("Export 범위에 보존할 수 없는 객체가 있습니다")
+        # setDetailedText 의 "Show Details..." 버튼은 번역되지 않아 목록을 본문에 싣는다.
+        limit = _INCOMPLETE_EXPORT_LIST_LIMIT
+        listed = [f"• {name}" for name in objects[:limit]]
+        if len(objects) > limit:
+            listed.append(translate_text("외 {}개").format(len(objects) - limit))
         message_box.setText(
-            "선택한 범위에 이 덤프 형식이 보존할 수 없는 객체가 있어 Export를 시작하지 않았습니다 "
-            "(파일은 생성되지 않았습니다).\n\n"
-            "'테이블 데이터만 내보내기 (불완전)'를 선택하면 아래 객체를 제외하고 진행하며, "
-            "결과는 완전한 백업이 아닙니다."
+            translate_text(
+                "선택한 범위에 이 덤프 형식이 보존할 수 없는 객체가 있어 Export를 시작하지 않았습니다 "
+                "(파일은 생성되지 않았습니다).\n\n"
+                "'이 객체 없이 내보내기 (불완전)'를 선택하면 아래 객체만 빼고 "
+                "나머지 테이블의 구조와 데이터는 모두 내보냅니다. 결과는 완전한 백업이 아닙니다.\n\n"
+                "제외할 객체:"
+            )
+            + "\n" + "\n".join(listed)
         )
-        message_box.setDetailedText("\n".join(objects))
         proceed_button = message_box.addButton(
-            translate_text("테이블 데이터만 내보내기 (불완전)"),
+            translate_text("이 객체 없이 내보내기 (불완전)"),
             QMessageBox.ButtonRole.DestructiveRole,
         )
         proceed_button.setObjectName("export_incomplete_proceed")
@@ -1279,10 +1284,10 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def _retry_allow_incomplete(self) -> None:
         self._allow_incomplete = True
-        self._add_log("사용자가 '테이블 데이터만 내보내기 (불완전)'를 선택했습니다.")
+        self._add_log("사용자가 '이 객체 없이 내보내기 (불완전)'를 선택했습니다.")
         self.set_ui_enabled(False)
         self.collapse_config_section()
-        self.label_status.setText("테이블 데이터만 Export (불완전) 진행 중...")
+        self.label_status.setText("일부 객체를 제외한 Export (불완전) 진행 중...")
         worker = self._build_worker(
             self.export_schema,
             self.input_output_dir.text(),
@@ -1340,25 +1345,23 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         ):
             self._retry_allow_incomplete()
             return
+        # 권한 질문은 Export당 최대 두 번: parallel_strict 실패 후 한 번, 테이블 락까지
+        # 거부되면 한 번 더. 독립 스냅샷/단일 연결 모드는 다시 묻지 않는다.
+        table_lock_denied = (
+            self._snapshot_mode == "parallel_table_lock"
+            and mysql_parallel_snapshot_denied_privilege(message) == MYSQL_PRIVILEGE_LOCK_TABLES
+        )
         if (
             not success
-            and not self._mysql_single_connection_fallback
-            and not self._mysql_no_backup_lock_fallback
+            and (self._snapshot_mode == "parallel_strict" or table_lock_denied)
             and is_mysql_parallel_snapshot_privilege_error(message)
         ):
-            denied_privilege = mysql_parallel_snapshot_denied_privilege(message)
-            privilege_action = self._prompt_mysql_privilege_action(denied_privilege)
-            if privilege_action == "parallel_no_backup_lock":
-                self._retry_with_parallel_no_backup_lock()
-                return
-            if privilege_action == "continue":
-                self._retry_with_single_connection()
+            retry_mode = self._prompt_mysql_privilege_action(table_lock_denied)
+            if retry_mode != "cancel":
+                self._retry_with_snapshot_mode(retry_mode)
                 return
             handled_privilege_failure = True
-            if privilege_action == "guidance":
-                self._show_mysql_privilege_guidance()
-            else:
-                self._add_log("병렬 Export 권한 안내에서 취소를 선택했습니다.")
+            self._add_log("병렬 Export 권한 안내에서 취소를 선택했습니다.")
 
         # 로그 기록
         self.export_end_time = datetime.now()
@@ -1381,8 +1384,12 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 설정 섹션 펼치기
         self.expand_config_section()
 
+        unsynchronized = self._snapshot_mode == "parallel_unsynchronized"
         if success:
             self.txt_log.addItem(f"✅ 완료: {message}")
+            if unsynchronized:
+                self.txt_log.addItem(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
+                self._add_log(f"⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}")
             # 최종 진행률 100% 표시
             self.progress_bar.setValue(100)
             self.progress_bar.setMaximum(100)  # 퍼센트 기준으로 재설정
@@ -1403,11 +1410,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
             self._show_export_done(
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
-                + (
-                    "\n\n⚠️ 테이블 데이터만 내보낸 불완전 Export입니다. "
-                    "제외된 객체는 결과 로그와 manifest 경고를 확인하세요."
-                    if self._allow_incomplete else ""
-                )
+                + (f"\n\n⚠️ {_UNSYNCHRONIZED_EXPORT_WARNING}" if unsynchronized else "")
+                + (f"\n\n⚠️ {_INCOMPLETE_EXPORT_WARNING}" if self._allow_incomplete else "")
             )
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")

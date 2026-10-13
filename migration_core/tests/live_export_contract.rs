@@ -307,3 +307,122 @@ fn unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds() {
         cleanup(&mut admin);
     }
 }
+
+/// Drops the throwaway accounts/database/output even when an assertion fails.
+struct MysqlThrowaway { admin: Endpoint, cleanup: Vec<String>, dirs: Vec<std::path::PathBuf> }
+
+impl MysqlThrowaway {
+    fn clean(&self) {
+        if let Ok(mut admin) = LiveAdapter::connect(&self.admin) {
+            for sql in &self.cleanup { let _ = admin.execute_sql(sql); }
+        }
+        for dir in &self.dirs { let _ = fs::remove_dir_all(dir); }
+    }
+}
+
+impl Drop for MysqlThrowaway {
+    fn drop(&mut self) { self.clean(); }
+}
+
+fn snapshot_worker_count(events: &[Value]) -> u64 {
+    events.iter().find_map(|event| event["worker_count"].as_u64()).unwrap_or_else(|| panic!("{events:#?}"))
+}
+
+#[test]
+#[ignore = "requires disposable TF_MYSQL_HOST and TF_POSTGRES_HOST tf_test databases"]
+fn mysql_table_lock_snapshot_needs_only_lock_tables_and_unsynchronized_is_not_strict() {
+    let Some(root) = endpoints().into_iter().find(|endpoint| endpoint.engine == "mysql") else { return; };
+    let (db, locker, plain) = ("tf_export_table_lock", "tf_export_locker", "tf_export_nolock");
+    let out = |name: &str| std::env::temp_dir().join(format!("{db}_{name}"));
+    let guard = MysqlThrowaway {
+        admin: root.clone(),
+        cleanup: vec![format!("DROP USER IF EXISTS '{locker}'@'%'"), format!("DROP USER IF EXISTS '{plain}'@'%'"), format!("DROP DATABASE IF EXISTS {db}")],
+        dirs: ["strict", "denied", "table_lock", "inflight", "unsynchronized"].map(out).to_vec(),
+    };
+    guard.clean();
+    let mut admin = LiveAdapter::connect(&root).unwrap();
+    for sql in [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE TABLE {db}.parent (id INT PRIMARY KEY, name VARCHAR(20))"),
+        format!("CREATE TABLE {db}.child (id INT PRIMARY KEY, parent_id INT NOT NULL, FOREIGN KEY (parent_id) REFERENCES {db}.parent (id))"),
+        format!("INSERT INTO {db}.parent VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+        format!("INSERT INTO {db}.child VALUES (10, 1), (11, 1), (12, 2), (13, 3)"),
+        // Minimum the dump needs plus LOCK TABLES; no RELOAD / BACKUP_ADMIN.
+        format!("CREATE USER '{locker}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("GRANT SELECT, LOCK TABLES ON {db}.* TO '{locker}'@'%'"),
+        format!("CREATE USER '{plain}'@'%' IDENTIFIED BY 'tf_local_test'"),
+        format!("GRANT SELECT ON {db}.* TO '{plain}'@'%'"),
+    ] { admin.execute_sql(&sql).unwrap(); }
+    let as_user = |user: &str| Endpoint { user: user.into(), database: db.into(), ..root.clone() };
+    let in_db = Endpoint { database: db.into(), ..root.clone() };
+    let rows = |table: &str| {
+        let result = run(&in_db, "query.execute", json!({"sql": format!("SELECT * FROM {table} ORDER BY id")}));
+        result["rows"].as_array().unwrap().iter().map(Value::to_string).collect::<Vec<_>>()
+    };
+    let expected = [rows("parent"), rows("child")];
+    let error_of = |events: &[Value]| events.iter().find(|e| e["event"] == "error").map(|e| e["message"].as_str().unwrap().to_string()).unwrap_or_else(|| panic!("{events:#?}"));
+    let payload = |mode: &str, dir: &str| json!({"output_dir": out(dir), "threads": 4, "chunk_size": 1, "data_format": "jsonl", "mysql_snapshot_mode": mode});
+
+    // Strict needs global lock privileges the locker lacks.
+    let events = dump_events(&as_user(locker), payload("parallel_strict", "strict"));
+    assert!(error_of(&events).starts_with("MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:FLUSH_TABLES_OR_RELOAD:"), "{events:#?}");
+    // Without LOCK TABLES the table-lock mode reports its own marker.
+    let events = dump_events(&as_user(plain), payload("parallel_table_lock", "denied"));
+    assert!(error_of(&events).starts_with("MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:LOCK_TABLES:"), "{events:#?}");
+    assert!(!out("denied").join("_tunnelforge_dump.json").exists());
+
+    // Table-lock mode: parallel shared snapshot, and no lock is held while the data is dumped
+    // (a writer with a short lock wait would fail if the read lock were still held).
+    let mut writer = LiveAdapter::connect(&in_db).unwrap();
+    writer.execute_sql("SET SESSION lock_wait_timeout=5").unwrap();
+    let mut inserted = false;
+    let mut events = Vec::new();
+    let mut request = payload("parallel_table_lock", "table_lock");
+    request["endpoint"] = serde_json::to_value(as_user(locker)).unwrap();
+    handle_request_streaming(Request { command: "dump.run".into(), request_id: None, payload: request }, |event| {
+        if !inserted && event["event"] == "row_progress" {
+            writer.execute_sql("INSERT INTO parent VALUES (4, 'later')").unwrap();
+            inserted = true;
+        }
+        events.push(event);
+    });
+    assert!(inserted);
+    let result = events.iter().find(|e| e["event"] == "result").unwrap_or_else(|| panic!("{events:#?}"));
+    assert_eq!(result["snapshot_policy"], "mysql_table_lock_shared_snapshot");
+    assert_eq!(result["strict_export"], true);
+    assert_eq!(result["rows_dumped"], 7, "the later insert must stay outside the snapshot");
+    assert_eq!(snapshot_worker_count(&events), 4);
+    run(&in_db, "dump.import", json!({"input_dir": out("table_lock"), "mode": "replace", "threads": 2, "strict_manifest": true}));
+    assert_eq!([rows("parent"), rows("child")], expected);
+
+    // The read lock is what lines the workers up: an uncommitted write to an exported table
+    // makes LOCK TABLES wait, and every snapshot opened after it commits includes its rows.
+    let mut holder = LiveAdapter::connect(&in_db).unwrap();
+    for sql in ["START TRANSACTION", "INSERT INTO parent VALUES (5, 'inflight')", "INSERT INTO child VALUES (14, 5)"] {
+        holder.execute_sql(sql).unwrap();
+    }
+    let dump = {
+        let (endpoint, request) = (as_user(locker), payload("parallel_table_lock", "inflight"));
+        std::thread::spawn(move || dump_events(&endpoint, request))
+    };
+    let lock_waits = |_| {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let result = run(&root, "query.execute", json!({"sql": "SELECT ID FROM performance_schema.processlist WHERE INFO LIKE 'LOCK TABLES%' AND STATE = 'Waiting for table metadata lock'"}));
+        result["rows"].as_array().is_some_and(|rows| !rows.is_empty())
+    };
+    let waited = (0..150).any(lock_waits);
+    holder.execute_sql("COMMIT").unwrap();
+    let events = dump.join().unwrap();
+    assert!(waited, "LOCK TABLES must wait for the in-flight writer: {events:#?}");
+    let result = events.iter().find(|e| e["event"] == "result").unwrap_or_else(|| panic!("{events:#?}"));
+    assert_eq!(result["rows_dumped"], 9, "the snapshot must include the writer's parent and child");
+
+    // Explicit unsynchronized opt-in: parallel, no lock privilege, never strict.
+    let events = dump_events(&as_user(plain), payload("parallel_unsynchronized", "unsynchronized"));
+    let result = events.iter().find(|e| e["event"] == "result").unwrap_or_else(|| panic!("{events:#?}"));
+    assert_eq!(result["snapshot_policy"], "mysql_parallel_unsynchronized_snapshots");
+    assert_eq!(result["strict_export"], false);
+    assert!(result["manifest_warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("without a shared lock")), "{result}");
+    assert_eq!(result["rows_dumped"], 9);
+    assert_eq!(snapshot_worker_count(&events), 4);
+}

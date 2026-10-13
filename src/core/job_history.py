@@ -276,7 +276,7 @@ class JobHistory:
         return record.id
 
     def finish(self, job_id: str, status: str, *, error: str = '', report_path: str = '', log_path: str = '',
-               details: Optional[Dict[str, Any]] = None, now: Optional[datetime] = None) -> bool:
+               mode: str = '', details: Optional[Dict[str, Any]] = None, now: Optional[datetime] = None) -> bool:
         if status not in FINAL_STATUSES:
             raise ValueError(f'not a final status: {status}')
         with _WRITE_LOCK:
@@ -290,6 +290,8 @@ class JobHistory:
                         record.report_path = scrub_text(report_path, 500)
                     if log_path:
                         record.log_path = scrub_text(log_path, 500)
+                    if mode:  # a retry may have run in a different mode than the one recorded at begin
+                        record.mode = scrub_text(mode, MAX_FIELD_CHARS)
                     if details:
                         record.details = _clean_details({**record.details, **details})
                     self._write(records)

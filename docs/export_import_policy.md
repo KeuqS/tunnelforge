@@ -33,7 +33,7 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | --- | --- |
 | `safe` (default) | Restores the complete same-engine dump into a new owned namespace, verifies rows, values and schema, then offers reviewed replacement when supported. Existing namespaces remain unchanged during preparation. |
 | Overwrite (UI) | Runs `safe`, then, after one up-front confirmation, swaps the verified candidate in under the original name with the core's promotion plan; the replaced data stays under a backup name. The swap is automatic only for a `ready_for_switch` restore whose plan is promotable with no blockers; anything else falls back to the reviewed choice. The core receives `mode: safe` and `dump.promote`; there is no separate core mode. |
-| `replace` | Like mysqldump: each selected dump table is dropped and immediately recreated and loaded, one table at a time, then indexes/FKs/views are finalized. Existing selected-table data is lost. A failure leaves at most the table in progress missing or partially loaded; tables not yet reached keep their original data, but may have lost FKs to already replaced parents (reported). |
+| `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 | `merge` | Appends dump rows to compatible existing tables (creates missing tables). It is not synchronization, deduplication, upsert, or change-data capture. Existing keys/FKs can reject rows. Existing MySQL targets must use InnoDB. |
 
@@ -47,7 +47,15 @@ because re-creating the parent would otherwise fail (ERROR 1822/6125) right afte
 the drop. FKs between selected tables are dropped from the not-yet-replaced child
 just before its parent is replaced and recreated from the dump after loading.
 Unsupported target actions, including MySQL `SET DEFAULT` foreign keys, fail
-preflight.
+preflight. AUTO_INCREMENT on a parent key is not a type change for this check.
+
+Before any table is dropped, the target server checks the import itself: every
+selected table is created once under a temporary probe name, for `replace` with
+its indexes and foreign keys (an FK to a table outside the dump points at the
+live target table), and all probes are then removed. A rejected definition, a
+missing REFERENCES privilege, or an FK that no longer fits a parent outside the
+dump stops the import with the target unchanged. A view or other non-table
+object that already uses a selected table's name is refused the same way.
 
 ### Safe restoration and destination names
 
@@ -147,11 +155,15 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 - Advanced `replace`/`recreate`/`merge` are **not one atomic transaction**. MySQL DDL commits,
   earlier successful chunks and already running parallel workers may remain after
   a later failure. No new chunks are scheduled once a worker failure is known.
-- Failed/unattempted/data-loaded tables are reported separately. Data-loaded does
-  not mean all deferred indexes/FKs or final verification completed. A failed
+- Failed/unattempted/data-loaded tables are reported separately. In `replace`, a
+  table that failed while being finished is the failed table; tables before it
+  already have their indexes and FKs. Data-loaded does not mean views or final
+  verification completed. A failed
   `replace` reports `dropped_not_restored_tables` (dropped, not fully reloaded),
-  `unattempted_tables` (original data kept) and `dropped_foreign_keys`; the Import
-  failure dialog lists them, including FKs removed from untouched original tables.
+  `unattempted_tables` (original data kept), `dropped_foreign_keys` (with each
+  original definition) and `restored_foreign_keys` (dropped child FKs linked again
+  after the failure); the Import failure dialog lists them, including FKs still
+  missing from untouched original tables.
 - UI subset retry is disabled: retrying only unfinished tables could leave earlier
   tables without deferred constraints. Inspect the partial target and rerun the
   full original selected scope from the dump with explicit confirmation. Never
@@ -162,10 +174,24 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 
 ## Snapshot, time and parallelism
 
-- Strict parallel MySQL export uses a shared consistent InnoDB snapshot and
-  requires the corresponding lock privileges. The privilege fallback is an
-  explicitly selected single-connection snapshot. The old no-backup-lock option
-  now uses one worker, not independent inconsistent snapshots.
+- MySQL export snapshot modes (`mysql_snapshot_mode` of `dump.run`):
+
+  | Mode | Privileges | Behavior | Manifest |
+  | --- | --- | --- | --- |
+  | `parallel_strict` (default) | RELOAD (or FLUSH_TABLES), BACKUP_ADMIN | All workers open one shared consistent InnoDB snapshot under `FLUSH TABLES WITH READ LOCK` + `LOCK INSTANCE FOR BACKUP`; the global read lock is acquired within a 2-second limit and released right after the snapshot opens, while DDL stays blocked until the export ends. | `mysql_shared_consistent_snapshot`, `strict_export=true` |
+  | `parallel_table_lock` | LOCK TABLES, SELECT | `LOCK TABLES ... READ` on exactly the exported tables (2-second wait limit) while every worker opens its consistent snapshot, then `UNLOCK TABLES` before any data is read. Writes to those tables wait during that moment. Same point-in-time guarantee as strict; DDL changes are checked after the dump. | `mysql_table_lock_shared_snapshot`, `strict_export=true` |
+  | `parallel_unsynchronized` | none beyond SELECT | Explicit opt-in. Each worker takes its own snapshot without any lock, so cross-table and cross-chunk point-in-time consistency is **not** guaranteed. | `mysql_parallel_unsynchronized_snapshots`, `strict_export=false`, persistent warning; Import reports it again |
+  | `single_connection` | none beyond SELECT | One connection, one consistent snapshot, one worker. | `mysql_single_connection_consistent_snapshot`, `strict_export=true` |
+  | `parallel_no_backup_lock` | none beyond SELECT | Kept for API compatibility; runs like `single_connection`. | same as `single_connection` |
+
+  When `parallel_strict` is refused for missing privileges, the Export dialog asks
+  once: continue in parallel with the table lock (recommended, default), continue
+  in parallel without point-in-time consistency, continue with one connection, or
+  cancel. If the table-lock retry is refused because LOCK TABLES is also missing,
+  it asks a second and last time with only one connection (default) or
+  unsynchronized parallel. A new export starts from `parallel_strict` again, and
+  re-opening an export from the job list never reuses a recorded snapshot mode.
+  Granting RELOAD and BACKUP_ADMIN avoids the question.
 - PostgreSQL table export uses one read-only repeatable-read transaction and
   locks exported tables against destructive DDL. Nullable UNIQUE columns are not
   used as keyset cursors. Large keyless MySQL tables use a single streaming read.
@@ -226,8 +252,10 @@ Default behavior: when the selected scope contains any refused object, `dump.run
 fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
 object) and `bypassable`. Only the waivable objects can be omitted, and only by
-the explicit choice "table data only (incomplete)" (`allow_incomplete: true` in the
-`dump.run` payload; the UI asks after showing the object list). That choice
+the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
+true` in the `dump.run` payload; the UI lists the objects, up to 10 inline plus a
+count of the rest, before asking). The structure and data of all remaining tables
+are still exported; only the listed objects are left out. That choice
 keeps `strict_export=false` and adds a persistent `Object not exported: ...`
 warning per object. Lossy table definitions (`bypassable: false`) cannot be
 waived. Scheduled backups have no such prompt and therefore fail with the

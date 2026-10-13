@@ -21,7 +21,6 @@ const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
 const MYSQL_IMPORT_NET_TIMEOUT_SECS: u32 = 600;
 /// import 세션 튜닝에서 상향하는 wait_timeout(초).
 const MYSQL_IMPORT_WAIT_TIMEOUT_SECS: u32 = 28800;
-const MYSQL_IMPORT_MAX_WARNINGS: usize = 65_535;
 
 pub(crate) fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(json!({
@@ -110,6 +109,9 @@ fn source_dump_warnings(manifest: &DumpManifest) -> Vec<String> {
     if manifest.snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot" {
         warnings.push("legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
     }
+    if manifest.snapshot_policy == "mysql_parallel_unsynchronized_snapshots" {
+        warnings.push("source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+    }
     if !manifest.strict_export {
         warnings.push("source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into());
     }
@@ -131,6 +133,8 @@ struct ImportJournal {
     current_table: Option<String>,
     pending_drop: Option<String>,
     dropped_foreign_keys: Vec<Value>,
+    /// `table.constraint` of dropped child FKs re-added after a failure (child never reached).
+    restored_foreign_keys: Vec<String>,
     rows_imported: u64,
     chunks_imported: u64,
     safe_context: Option<Value>,
@@ -146,6 +150,7 @@ impl ImportJournal {
             "dropped_tables": self.dropped, "data_loaded_tables": self.loaded,
             "dropped_not_restored_tables": self.dropped.iter().filter(|name| !self.loaded.contains(*name)).collect::<Vec<_>>(),
             "dropped_foreign_keys": self.dropped_foreign_keys,
+            "restored_foreign_keys": self.restored_foreign_keys,
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
@@ -190,7 +195,8 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
         load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
-        current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), rows_imported: 0, chunks_imported: 0,
+        current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), restored_foreign_keys: Vec::new(),
+        rows_imported: 0, chunks_imported: 0,
         safe_context,
     };
     // Replacing a prior success report is a prerequisite for starting a new attempt.
@@ -221,7 +227,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
-    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
+    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -375,9 +381,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             "message":"서버에서 테이블 생성 정의를 검증 중입니다. 기존 대상 테이블은 아직 변경하지 않습니다."}));
         if matches!(mode, "replace" | "recreate") {
             validate_postgres_drop_dependencies(&mut adapter, &target_schema, &tables)?;
+            // Foreign keys are now added table by table, so refuse incompatible ones before any DROP.
+            validate_foreign_key_column_compatibility(&import_schema)?;
         }
         validate_target_check_names(&mut adapter, &target_schema, &import_schema)?;
-        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal)?;
+        refuse_non_table_name_collisions(&mut adapter, &target_schema, &import_schema)?;
+        probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal, should_apply_post_load_ddl(mode))?;
         journal.current_table = None;
         journal.phase = "dump_import_prepare".into();
         journal.checkpoint()?;
@@ -393,6 +402,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         )?;
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+        let target_engine = adapter.engine();
+        let mut completed_tables = BTreeSet::new();
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
                 .schema
@@ -459,6 +470,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.loaded.push(table.name.clone());
             journal.rows_imported = rows_imported;
             journal.chunks_imported = chunks_imported;
+            if should_apply_post_load_ddl(mode) {
+                // Finish this table now, so a later failure leaves every earlier table complete.
+                journal.phase = "dump_import_post_load".into();
+                journal.checkpoint()?;
+                complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
+            }
             journal.current_table = None;
             journal.checkpoint()?;
             emit(json!({
@@ -472,6 +489,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         }
         Ok(())
     })();
+    if import_result.is_err() {
+        restore_unreached_child_foreign_keys(&mut adapter, journal, request.request_id.clone(), &mut emit);
+    }
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
     let local_infile_restore_result = restore_mysql_local_infile_policy(
         &mut adapter,
@@ -492,7 +512,6 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     finalize_dump_import(
         &mut adapter,
         &manifest,
-        &import_schema,
         &tables,
         &imported_rows_by_table,
         input_dir,
@@ -511,39 +530,93 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     )
 }
 
+/// Builds every selected table under an owned probe name before any target table is dropped. For
+/// replace imports the probes also get the indexes and foreign keys the import adds after each
+/// table, so a missing REFERENCES privilege or an incompatible parent outside the dump stops the
+/// import while the target is still untouched.
 fn probe_import_ddl(
-    adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal,
+    adapter: &mut LiveAdapter, schema: &NormalizedSchema, source_engine: &str, journal: &mut ImportJournal, with_post_load: bool,
 ) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("cannot allocate DDL probe name: {err}"))?.as_nanos();
-    for (index, table) in schema.tables.iter().enumerate() {
-        journal.current_table = Some(table.name.clone());
-        journal.checkpoint()?;
-        let mut probe = table.clone();
-        probe.name = format!("tf_probe_{}_{nonce}_{index}", std::process::id());
-        for (check_index, check) in probe.checks.iter_mut().enumerate() {
-            check.name = format!("{}_c{check_index}", probe.name);
-        }
-        let ddl = generate_table_ddl(&probe, source_engine, adapter.engine())
-            .ok_or_else(|| format!("DDL probe generation failed for {}", table.name))?;
-        // Raw execution must fail on collisions; create_table intentionally treats
-        // existing tables as valid during merge and cannot establish ownership.
-        let drop_sql = drop_table_sql(adapter.engine(), &probe.name);
-        execute_owned_ddl_probe(&ddl, &drop_sql, &table.name, &probe.name, |sql| adapter.execute_sql(sql))?;
-    }
-    Ok(())
+    let prefix = format!("tf_probe_{}_{nonce}", std::process::id());
+    let engine = adapter.engine();
+    run_owned_ddl_probe(schema, source_engine, engine, with_post_load, &prefix,
+        |table| { journal.current_table = Some(table.to_string()); journal.checkpoint() },
+        |sql| adapter.execute_sql(sql))
 }
 
-fn execute_owned_ddl_probe(
-    create_sql: &str, drop_sql: &str, original_name: &str, probe_name: &str,
+fn run_owned_ddl_probe(
+    schema: &NormalizedSchema, source_engine: &str, engine: &str, with_post_load: bool, prefix: &str,
+    mut enter_table: impl FnMut(&str) -> Result<(), String>,
     mut execute: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
-    execute(create_sql).map_err(|err| classified_import_error(
-        "ddl_preflight_failed", &format!("server rejected CREATE TABLE before target replacement: {err}"), Some(original_name),
-    ))?;
-    execute(drop_sql).map_err(|err| classified_import_error(
-        "ddl_probe_cleanup_failed", &format!("owned probe {probe_name} could not be removed; original target tables were not changed: {err}"), Some(original_name),
-    ))
+    let probe_names = schema.tables.iter().enumerate()
+        .map(|(index, table)| (table.name.as_str(), format!("{prefix}_{index}")))
+        .collect::<BTreeMap<_, _>>();
+    let rejected = |what: &str, table: &str, err: String| classified_import_error(
+        "ddl_preflight_failed", &format!("server rejected {what} before target replacement: {err}"), Some(table),
+    );
+    let mut created = Vec::new();
+    let mut build = || -> Result<(), String> {
+        for table in &schema.tables {
+            enter_table(&table.name)?;
+            let mut probe = table.clone();
+            probe.name = probe_names[table.name.as_str()].clone();
+            for (check_index, check) in probe.checks.iter_mut().enumerate() {
+                check.name = format!("{}_c{check_index}", probe.name);
+            }
+            // PostgreSQL index names are schema-wide.
+            for (index_index, index) in probe.indexes.iter_mut().enumerate() {
+                index.name = format!("{}_i{index_index}", probe.name);
+            }
+            let ddl = generate_table_ddl(&probe, source_engine, engine)
+                .ok_or_else(|| format!("DDL probe generation failed for {}", table.name))?;
+            // Raw execution must fail on collisions; create_table intentionally treats
+            // existing tables as valid during merge and cannot establish ownership.
+            execute(&ddl).map_err(|err| rejected("CREATE TABLE", &table.name, err))?;
+            created.push(probe.name.clone());
+            if with_post_load {
+                for sql in secondary_index_ddl(&probe, engine) {
+                    execute(&sql).map_err(|err| rejected("CREATE INDEX", &table.name, err))?;
+                }
+            }
+        }
+        if !with_post_load {
+            return Ok(());
+        }
+        for table in &schema.tables {
+            enter_table(&table.name)?;
+            let probe = &probe_names[table.name.as_str()];
+            for (fk_index, original) in table.foreign_keys.iter().enumerate() {
+                let mut fk = original.clone();
+                fk.name = format!("{probe}_f{fk_index}");
+                // A parent outside the import set stays the live target table, as in the real import.
+                if let Some(parent) = probe_names.get(fk.referenced_table.as_str()) {
+                    fk.referenced_table = parent.clone();
+                }
+                if let Some(sql) = foreign_key_ddl(probe, &fk, engine) {
+                    execute(&sql).map_err(|err| rejected(&format!("FOREIGN KEY {}", original.name), &table.name, err))?;
+                }
+            }
+        }
+        Ok(())
+    };
+    let result = build();
+    if created.is_empty() {
+        return result;
+    }
+    // One statement, so probes that reference each other drop together.
+    let names = created.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
+    let cleanup = execute(&format!("DROP TABLE IF EXISTS {names}")).map_err(|err| classified_import_error(
+        "ddl_probe_cleanup_failed",
+        &format!("owned probes {} could not be removed; original target tables were not changed: {err}", created.join(", ")),
+        None,
+    ));
+    match (result, cleanup) {
+        (Err(err), Err(cleanup)) => Err(format!("{err}; additionally: {cleanup}")),
+        (result, cleanup) => result.and(cleanup),
+    }
 }
 
 /// replace/recreate 모드일 때 대상 테이블을 바꾸기 전에 막을 수 있는 실패를 먼저 거부한다.
@@ -608,12 +681,14 @@ fn replace_target_table<F: FnMut(Value)>(
     }
     let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
     for (child, constraint) in incoming_import_set_foreign_keys(adapter, target_schema, table, planned)? {
+        // Kept so the FK can be re-added if the import stops before the child's own turn.
+        let definition = foreign_key_definition(adapter, target_schema, &child, &constraint)?;
         let engine = adapter.engine();
         let drop_keyword = if engine == "mysql" { "FOREIGN KEY" } else { "CONSTRAINT" };
         let sql = format!("ALTER TABLE {} DROP {drop_keyword} {}", quote_ident(engine, &child), quote_ident(engine, &constraint));
         adapter.execute_sql(&sql)
             .map_err(|err| dump_import_ddl_error("drop_foreign_key", &format!("{child}.{constraint}"), &err))?;
-        journal.dropped_foreign_keys.push(json!({"table": child, "constraint": constraint, "referenced_table": table}));
+        journal.dropped_foreign_keys.push(json!({"table": child, "constraint": constraint, "referenced_table": table, "definition": definition}));
         journal.checkpoint()?;
         emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
             "action":"drop_foreign_key", "status":"completed", "table":child, "constraint":constraint,
@@ -634,6 +709,65 @@ fn replace_target_table<F: FnMut(Value)>(
 
 /// `parent`를 참조하는 같은 스키마 import set 테이블의 FK `(child, constraint)` 목록.
 /// 자기 참조 FK는 테이블과 함께 사라지므로 제외한다.
+/// The target's own `FOREIGN KEY (...) REFERENCES ...` clause for one constraint.
+fn foreign_key_definition(adapter: &mut LiveAdapter, schema: &str, table: &str, constraint: &str) -> Result<String, String> {
+    let inspect_error = |err: &dyn std::fmt::Display| format!("target foreign key definition inspection failed for {table}.{constraint}: {err}");
+    match adapter {
+        LiveAdapter::MySql(conn) => {
+            let columns: Vec<(String, String, String)> = conn.exec(
+                "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
+                 WHERE CONSTRAINT_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_NAME=? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION",
+                (schema, table, constraint),
+            ).map_err(|err| inspect_error(&err))?;
+            let rules: Option<(String, String)> = conn.exec_first(
+                "SELECT DELETE_RULE, UPDATE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
+                (schema, table, constraint),
+            ).map_err(|err| inspect_error(&err))?;
+            let (Some((_, parent, _)), Some((on_delete, on_update))) = (columns.first(), rules) else {
+                return Err(inspect_error(&"constraint not found"));
+            };
+            let list = |pick: fn(&(String, String, String)) -> &String| columns.iter().map(|column| quote_ident("mysql", pick(column))).collect::<Vec<_>>().join(", ");
+            Ok(format!("FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {on_delete} ON UPDATE {on_update}",
+                list(|column| &column.0), quote_ident("mysql", parent), list(|column| &column.2)))
+        }
+        LiveAdapter::PostgreSql(client) => client.query_one(
+            "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid \
+             JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=$1 AND t.relname=$2 AND c.conname=$3",
+            &[&schema, &table, &constraint],
+        ).map(|row| row.get(0)).map_err(|err| inspect_error(&err)),
+    }
+}
+
+/// After a failed replace, re-adds the FKs taken from children the import never reached, so they
+/// keep their FK as well as their rows. Only parents that were reloaded are linked again; MySQL does
+/// it with foreign_key_checks=0, as the import itself does. Best effort: what fails stays reported
+/// as dropped.
+fn restore_unreached_child_foreign_keys<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter, journal: &mut ImportJournal, request_id: Option<String>, emit: &mut F,
+) {
+    let engine = adapter.engine();
+    if engine == "mysql" && adapter.execute_sql("SET SESSION foreign_key_checks=0").is_err() {
+        return;
+    }
+    for fk in journal.dropped_foreign_keys.clone() {
+        let (Some(child), Some(constraint), Some(parent), Some(definition)) = (
+            fk["table"].as_str(), fk["constraint"].as_str(), fk["referenced_table"].as_str(), fk["definition"].as_str(),
+        ) else { continue };
+        if journal.load_attempted.contains(child) || !journal.loaded.iter().any(|name| name == parent) {
+            continue;
+        }
+        let sql = format!("ALTER TABLE {} ADD CONSTRAINT {} {definition}", quote_ident(engine, child), quote_ident(engine, constraint));
+        let result = adapter.execute_sql(&sql);
+        if result.is_ok() {
+            journal.restored_foreign_keys.push(format!("{child}.{constraint}"));
+        }
+        emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
+            "action":"restore_foreign_key", "status": if result.is_ok() { "completed" } else { "failed" },
+            "table":child, "constraint":constraint, "message": result.err()}));
+    }
+    let _ = journal.checkpoint();
+}
+
 fn incoming_import_set_foreign_keys(
     adapter: &mut LiveAdapter, schema: &str, parent: &str, planned: &BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
@@ -675,6 +809,39 @@ fn import_target_table_exists(adapter: &mut LiveAdapter, schema: &str, table: &s
             &[&schema, &table],
         ).map(|row| row.get::<_, bool>(0)).map_err(|err| format!("target table inspection failed: {err}")),
     }
+}
+
+/// DROP TABLE cannot replace a view (or any other non-table object) that has a dump table's name,
+/// so refuse before any target table changes.
+fn refuse_non_table_name_collisions(adapter: &mut LiveAdapter, schema: &str, import_schema: &NormalizedSchema) -> Result<(), String> {
+    let names = import_schema.tables.iter().map(|table| table.name.clone()).collect::<Vec<_>>();
+    let inspect_error = |err: &dyn std::fmt::Display| format!("target object inspection failed: {err}");
+    let collisions: Vec<String> = match adapter {
+        LiveAdapter::MySql(conn) => {
+            let rows: Vec<(String, String)> = conn.exec(
+                "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_TYPE<>'BASE TABLE'",
+                (schema,),
+            ).map_err(|err| inspect_error(&err))?;
+            // Case-insensitive like lower_case_table_names servers; a false refusal is safe.
+            rows.into_iter()
+                .filter(|(name, _)| names.iter().any(|table| table.eq_ignore_ascii_case(name)))
+                .map(|(name, kind)| format!("{name} ({kind})"))
+                .collect()
+        }
+        LiveAdapter::PostgreSql(client) => client.query(
+            "SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'S' THEN 'SEQUENCE' WHEN 'c' THEN 'TYPE' ELSE 'INDEX' END FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind NOT IN ('r','p') ORDER BY 1",
+            &[&schema, &names],
+        ).map_err(|err| inspect_error(&err))?
+            .iter().map(|row| format!("{} ({})", row.get::<_, String>(0), row.get::<_, String>(1))).collect(),
+    };
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(classified_import_error(
+        "ddl_preflight_failed",
+        &format!("target objects that are not tables already use these names; no target tables were changed: {}", collisions.join(", ")),
+        None,
+    ))
 }
 
 fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, tables: &[DumpTableManifest]) -> Result<(), String> {
@@ -815,8 +982,9 @@ fn import_table_rows<F: FnMut(Value)>(
         let row_count = rows.len() as u64;
         if let LiveAdapter::MySql(conn) = adapter {
             let enum_zero = enum_zero_cells(table, &rows);
-            if enum_zero.len() > MYSQL_IMPORT_MAX_WARNINGS {
-                for batch in rows.chunks(enum_warning_batch_rows(table)) {
+            let warning_cap = if enum_zero.is_empty() { usize::MAX } else { enum_warning_cap(conn, table)? };
+            if enum_zero.len() > warning_cap {
+                for batch in rows.chunks(enum_warning_batch_rows(table, warning_cap)) {
                     let cells = enum_zero_cells(table, batch);
                     execute_mysql_import_statement(conn, &insert_rows_literal_sql_for_table("mysql", table, batch), table, &cells)?;
                 }
@@ -853,7 +1021,6 @@ fn import_table_rows<F: FnMut(Value)>(
 fn finalize_dump_import<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
     manifest: &DumpManifest,
-    import_schema: &NormalizedSchema,
     tables: &[DumpTableManifest],
     imported_rows_by_table: &BTreeMap<String, u64>,
     input_dir: &str,
@@ -870,14 +1037,14 @@ fn finalize_dump_import<F: FnMut(Value)>(
     let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     if should_apply_post_load_ddl(mode) {
+        // Indexes and foreign keys were created right after each table's data.
         emit(json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import_post_load",
-            "message": "현재 단계: 인덱스/FK 생성 중 - 데이터 Import는 완료, 후처리 진행 중",
-            "strategy": "post_load_ddl"
+            "message": "현재 단계: 마무리 확인 중 - 인덱스/FK는 테이블마다 적재 직후 생성했습니다",
+            "strategy": "per_table_post_load"
         }));
-        apply_post_load_ddl(adapter, import_schema, &target_engine)?;
     } else {
         emit(json!({
             "event": "phase",
@@ -1496,7 +1663,6 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
-            "SET SESSION max_error_count=65535".to_string(),
             "SET SESSION lc_messages='en_US'".to_string(),
             // 서버 측 세션 idle/전송 타임아웃 상향 — 대량 청크 전송 중 서버가
             // net_read/net_write_timeout(기본 30/60s)이나 wait_timeout으로 먼저
@@ -1514,6 +1680,9 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
     }
     for sql in mysql_import_session_tuning_sql(restore) {
         adapter.execute_sql(&sql)?;
+    }
+    if let (LiveAdapter::MySql(conn), false) = (adapter, restore) {
+        raise_mysql_max_error_count(conn).map_err(|err| format!("mysql SQL execution error: {err}"))?;
     }
     Ok(())
 }
@@ -1606,11 +1775,12 @@ fn insert_mysql_tsv_chunk_with_batches(
     chunk_path: &Path,
     compression: &str,
 ) -> Result<u64, String> {
+    let batch_rows = enum_warning_batch_rows(table, enum_warning_cap(conn, table)?);
     stream_tsv_rows_in_batches(
         chunk_path,
         table,
         compression,
-        enum_warning_batch_rows(table),
+        batch_rows,
         MYSQL_INSERT_FALLBACK_BATCH_BYTES,
         |rows| {
             let enum_zero = enum_zero_cells(table, rows);
@@ -1817,7 +1987,7 @@ fn load_mysql_tsv_chunk(
             }
         }
     }
-    if enum_zero.len() > MYSQL_IMPORT_MAX_WARNINGS {
+    if !enum_zero.is_empty() && enum_zero.len() > enum_warning_cap(conn, table)? {
         // Diagnostics cannot describe more warnings than max_error_count. Split
         // before executing LOAD DATA, so every accepted warning stays inspectable.
         return insert_mysql_tsv_chunk_with_batches(conn, table, chunk_path, compression);
@@ -1870,9 +2040,21 @@ fn is_legacy_enum_zero_type(type_name: &str) -> bool {
     mysql_enum_labels(type_name).is_some_and(|labels| !labels.iter().any(String::is_empty))
 }
 
-fn enum_warning_batch_rows(table: &NormalizedTable) -> usize {
+/// How many warnings SHOW WARNINGS can list on this session. An account without
+/// SESSION_VARIABLES_ADMIN keeps the server default (1024 on MySQL 8), so batches are sized
+/// from the real value. Tables without legacy ENUM columns never produce the warnings.
+fn enum_warning_cap(conn: &mut mysql::PooledConn, table: &NormalizedTable) -> Result<usize, String> {
+    if !table.columns.iter().any(|column| is_legacy_enum_zero_type(&column.type_name)) {
+        return Ok(usize::MAX);
+    }
+    let cap: Option<u64> = conn.query_first("SELECT @@SESSION.max_error_count")
+        .map_err(|err| format!("cannot read max_error_count: {err}"))?;
+    Ok(cap.unwrap_or(64).max(1) as usize)
+}
+
+fn enum_warning_batch_rows(table: &NormalizedTable, warning_cap: usize) -> usize {
     let columns = table.columns.iter().filter(|column| is_legacy_enum_zero_type(&column.type_name)).count().max(1);
-    MYSQL_INSERT_FALLBACK_BATCH_ROWS.min((MYSQL_IMPORT_MAX_WARNINGS / columns).max(1))
+    MYSQL_INSERT_FALLBACK_BATCH_ROWS.min((warning_cap / columns).max(1))
 }
 
 fn enum_zero_cells(table: &NormalizedTable, rows: &[Value]) -> BTreeSet<(String, u64)> {
@@ -2034,21 +2216,41 @@ mod tests {
     }
 
     #[test]
-    fn ddl_probe_never_cleans_up_a_collision_and_surfaces_owned_cleanup_failure() {
-        let mut statements = Vec::new();
-        let collision = execute_owned_ddl_probe("CREATE TABLE probe", "DROP TABLE probe", "original", "probe", |sql| {
-            statements.push(sql.to_string());
-            Err("table already exists".into())
-        });
-        assert!(collision.unwrap_err().contains("ddl_preflight_failed"));
-        assert_eq!(statements, ["CREATE TABLE probe"]);
-        statements.clear();
-        let cleanup = execute_owned_ddl_probe("CREATE TABLE probe", "DROP TABLE probe", "original", "probe", |sql| {
-            statements.push(sql.to_string());
-            if sql.starts_with("DROP") { Err("DROP denied".into()) } else { Ok(()) }
-        });
-        assert!(cleanup.unwrap_err().contains("ddl_probe_cleanup_failed"));
-        assert_eq!(statements, ["CREATE TABLE probe", "DROP TABLE probe"]);
+    fn ddl_probe_links_foreign_keys_and_drops_only_the_probes_it_created() {
+        use crate::adapters::test_support::{fk, schema as sample_schema};
+        let parent = sample_schema().tables.remove(0);
+        let mut child = parent.clone();
+        child.name = "orders".into();
+        child.foreign_keys = vec![fk("orders_user", "users"), fk("orders_outside", "accounts")];
+        let schema = NormalizedSchema { tables: vec![parent, child] };
+        let run = |fail: &str| {
+            let mut statements = Vec::new();
+            let result = run_owned_ddl_probe(&schema, "mysql", "mysql", true, "p", |_| Ok(()), |sql| {
+                statements.push(sql.to_string());
+                if !fail.is_empty() && sql.contains(fail) { Err("denied".into()) } else { Ok(()) }
+            });
+            (result, statements)
+        };
+
+        let (result, statements) = run("");
+        result.unwrap();
+        // A parent inside the dump is its probe; a parent outside it stays the live target table.
+        assert!(statements.iter().any(|sql| sql.contains("FOREIGN KEY (`parent_id`) REFERENCES `p_0`")));
+        assert!(statements.iter().any(|sql| sql.contains("REFERENCES `accounts`")));
+        assert_eq!(statements.last().unwrap(), "DROP TABLE IF EXISTS `p_0`, `p_1`");
+
+        let (result, statements) = run("REFERENCES `accounts`");
+        let err = result.unwrap_err();
+        assert!(err.starts_with("ddl_preflight_failed: orders: server rejected FOREIGN KEY orders_outside"), "{err}");
+        assert_eq!(statements.last().unwrap(), "DROP TABLE IF EXISTS `p_0`, `p_1`");
+
+        // A name collision is not ours to drop; only the probe created before it is.
+        let (result, statements) = run("CREATE TABLE `p_1`");
+        assert!(result.unwrap_err().starts_with("ddl_preflight_failed"));
+        assert_eq!(statements.last().unwrap(), "DROP TABLE IF EXISTS `p_0`");
+
+        let (result, _) = run("DROP TABLE");
+        assert!(result.unwrap_err().starts_with("ddl_probe_cleanup_failed"));
     }
 
     #[test]
@@ -2095,6 +2297,13 @@ mod tests {
         manifest.strict_export = true;
         manifest.manifest_warnings.clear();
         assert!(source_dump_warnings(&manifest).is_empty());
+        manifest.snapshot_policy = "mysql_table_lock_shared_snapshot".into();
+        assert!(source_dump_warnings(&manifest).is_empty());
+        // Even a hand-edited strict flag cannot hide the unsynchronized opt-in.
+        manifest.snapshot_policy = "mysql_parallel_unsynchronized_snapshots".into();
+        let warnings = source_dump_warnings(&manifest);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("independent snapshots and no shared lock"));
     }
 
     #[test]
@@ -2297,7 +2506,6 @@ mod tests {
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
-            "SET SESSION max_error_count=65535".to_string(),
             "SET SESSION lc_messages='en_US'".to_string(),
                 "SET SESSION net_read_timeout = 600".to_string(),
                 "SET SESSION net_write_timeout = 600".to_string(),

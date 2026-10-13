@@ -142,114 +142,140 @@ pub fn generate_schema_ddl(
         .collect()
 }
 
-pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
-    if target.is_empty() {
-        return Vec::new();
-    }
+/// Secondary indexes created after the table's data (MySQL unique keys come with CREATE TABLE).
+pub(crate) fn secondary_index_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
     let mut ddl = Vec::new();
-    for table in &schema.tables {
-        for index in &table.indexes {
-            if index.columns.is_empty() {
-                continue;
-            }
-            // MySQL must expose referenced unique keys at CREATE TABLE time,
-            // even while foreign_key_checks=0 and target-only children survive.
-            if target == "mysql" && index.unique { continue; }
-            let unique = if index.unique { "UNIQUE " } else if index.spatial && target == "mysql" { "SPATIAL " } else { "" };
-            let columns = index
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| {
-                    let ident = quote_ident(target, column);
-                    // MySQL prefix 인덱스(col(255))는 prefix 길이를 보존한다. postgresql은 prefix
-                    // 인덱스 개념이 없어 full 컬럼으로 둔다. 구 덤프(column_prefixes 없음)는
-                    // get(i)=None으로 full 처리되어 기존 동작과 동일하다.
-                    // MySQL reports SUB_PART 32 for SPATIAL keys, but they take no prefix.
-                    match index.column_prefixes.get(i).copied().flatten() {
-                        Some(prefix) if target == "mysql" && !index.spatial => format!("{}({})", ident, prefix),
-                        _ => ident,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let visibility = if target == "mysql" && index.visible == Some(false) { " INVISIBLE" } else { "" };
-            ddl.push(format!(
-                "CREATE {}INDEX {} ON {} ({}){};",
-                unique,
-                quote_ident(target, &index.name),
-                quote_ident(target, &table.name),
-                columns,
-                visibility
-            ));
+    for index in &table.indexes {
+        if index.columns.is_empty() {
+            continue;
         }
-    }
-    for table in &schema.tables {
-        for fk in &table.foreign_keys {
-            if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
-                continue;
-            }
-            let columns = fk
-                .columns
-                .iter()
-                .map(|column| quote_ident(target, column))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let referenced_columns = fk
-                .referenced_columns
-                .iter()
-                .map(|column| quote_ident(target, column))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mut actions = String::new();
-            if let Some(action) = &fk.on_delete {
-                actions.push_str(&format!(" ON DELETE {}", action.as_sql()));
-            }
-            if let Some(action) = &fk.on_update {
-                actions.push_str(&format!(" ON UPDATE {}", action.as_sql()));
-            }
-            ddl.push(format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}){};",
-                quote_ident(target, &table.name),
-                quote_ident(target, &fk.name),
-                columns,
-                quote_ident(target, &fk.referenced_table),
-                referenced_columns,
-                actions
-            ));
-        }
-    }
-    if target == "postgresql" {
-        for table in &schema.tables {
-            if let Some(comment) = &table.comment { ddl.push(format!("COMMENT ON TABLE {} IS {};",quote_ident(target,&table.name),schema_string_literal(target,comment))); }
-            for column in &table.columns {
-                if let Some(comment) = &column.comment { ddl.push(format!("COMMENT ON COLUMN {}.{} IS {};",quote_ident(target,&table.name),quote_ident(target,&column.name),schema_string_literal(target,comment))); }
-            }
-        }
+        // MySQL must expose referenced unique keys at CREATE TABLE time,
+        // even while foreign_key_checks=0 and target-only children survive.
+        if target == "mysql" && index.unique { continue; }
+        let unique = if index.unique { "UNIQUE " } else if index.spatial && target == "mysql" { "SPATIAL " } else { "" };
+        let columns = index
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                let ident = quote_ident(target, column);
+                // MySQL prefix 인덱스(col(255))는 prefix 길이를 보존한다. postgresql은 prefix
+                // 인덱스 개념이 없어 full 컬럼으로 둔다. 구 덤프(column_prefixes 없음)는
+                // get(i)=None으로 full 처리되어 기존 동작과 동일하다.
+                // MySQL reports SUB_PART 32 for SPATIAL keys, but they take no prefix.
+                match index.column_prefixes.get(i).copied().flatten() {
+                    Some(prefix) if target == "mysql" && !index.spatial => format!("{}({})", ident, prefix),
+                    _ => ident,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let visibility = if target == "mysql" && index.visible == Some(false) { " INVISIBLE" } else { "" };
+        ddl.push(format!(
+            "CREATE {}INDEX {} ON {} ({}){};",
+            unique,
+            quote_ident(target, &index.name),
+            quote_ident(target, &table.name),
+            columns,
+            visibility
+        ));
     }
     ddl
 }
 
-pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+pub(crate) fn foreign_key_ddl(table: &str, fk: &NormalizedForeignKey, target: &str) -> Option<String> {
+    if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
+        return None;
+    }
+    let columns = fk.columns.iter().map(|column| quote_ident(target, column)).collect::<Vec<_>>().join(", ");
+    let referenced_columns = fk.referenced_columns.iter().map(|column| quote_ident(target, column)).collect::<Vec<_>>().join(", ");
+    let mut actions = String::new();
+    if let Some(action) = &fk.on_delete {
+        actions.push_str(&format!(" ON DELETE {}", action.as_sql()));
+    }
+    if let Some(action) = &fk.on_update {
+        actions.push_str(&format!(" ON UPDATE {}", action.as_sql()));
+    }
+    Some(format!(
+        "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}){};",
+        quote_ident(target, table),
+        quote_ident(target, &fk.name),
+        columns,
+        quote_ident(target, &fk.referenced_table),
+        referenced_columns,
+        actions
+    ))
+}
+
+fn comment_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
     if target != "postgresql" {
         return Vec::new();
     }
     let mut ddl = Vec::new();
-    for table in &schema.tables {
-        for column in &table.columns {
-            if is_auto_increment_type(&column.type_name) {
-                ddl.push(format!(
-                    "SELECT setval(pg_get_serial_sequence({}, {}), GREATEST(COALESCE((SELECT MAX({}) FROM {}), 0) + 1, {}), false);",
-                    schema_string_literal(target, &quote_ident(target, &table.name)),
-                    schema_string_literal(target, &column.name),
-                    quote_ident(target, &column.name),
-                    quote_ident(target, &table.name),
-                    table.auto_increment.unwrap_or(1)
-                ));
+    if let Some(comment) = &table.comment { ddl.push(format!("COMMENT ON TABLE {} IS {};",quote_ident(target,&table.name),schema_string_literal(target,comment))); }
+    for column in &table.columns {
+        if let Some(comment) = &column.comment { ddl.push(format!("COMMENT ON COLUMN {}.{} IS {};",quote_ident(target,&table.name),quote_ident(target,&column.name),schema_string_literal(target,comment))); }
+    }
+    ddl
+}
+
+fn sequence_reset_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
+    if target != "postgresql" {
+        return Vec::new();
+    }
+    table.columns.iter().filter(|column| is_auto_increment_type(&column.type_name)).map(|column| format!(
+        "SELECT setval(pg_get_serial_sequence({}, {}), GREATEST(COALESCE((SELECT MAX({}) FROM {}), 0) + 1, {}), false);",
+        schema_string_literal(target, &quote_ident(target, &table.name)),
+        schema_string_literal(target, &column.name),
+        quote_ident(target, &column.name),
+        quote_ident(target, &table.name),
+        table.auto_increment.unwrap_or(1)
+    )).collect()
+}
+
+pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    if target.is_empty() {
+        return Vec::new();
+    }
+    let mut ddl: Vec<String> = schema.tables.iter().flat_map(|table| secondary_index_ddl(table, target)).collect();
+    ddl.extend(schema.tables.iter().flat_map(|table| table.foreign_keys.iter().filter_map(|fk| foreign_key_ddl(&table.name, fk, target))));
+    ddl.extend(schema.tables.iter().flat_map(|table| comment_ddl(table, target)));
+    ddl
+}
+
+pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    schema.tables.iter().flat_map(|table| sequence_reset_ddl(table, target)).collect()
+}
+
+/// Finishes one just-loaded table of a replace import: its sequences, secondary indexes and
+/// comments, then every foreign key whose two tables are now both done (a parent outside the
+/// import set counts as done). A failure therefore leaves only this table unfinished; the tables
+/// before it are complete. MySQL callers already run with foreign_key_checks=0, as mysqldump does.
+pub(crate) fn complete_imported_table<A: MigrationAdapter>(
+    target: &mut A,
+    schema: &NormalizedSchema,
+    table: &NormalizedTable,
+    completed: &mut std::collections::BTreeSet<String>,
+    target_engine: &str,
+) -> Result<(), String> {
+    let mut ddl = sequence_reset_ddl(table, target_engine);
+    ddl.extend(secondary_index_ddl(table, target_engine));
+    ddl.extend(comment_ddl(table, target_engine));
+    completed.insert(table.name.clone());
+    let done = |name: &str| completed.contains(name) || !schema.tables.iter().any(|candidate| candidate.name == name);
+    for owner in &schema.tables {
+        for fk in &owner.foreign_keys {
+            // Added exactly once: when the later of its two tables completes.
+            let touches_this_table = owner.name == table.name || fk.referenced_table == table.name;
+            if touches_this_table && done(&owner.name) && done(&fk.referenced_table) {
+                ddl.extend(foreign_key_ddl(&owner.name, fk, target_engine));
             }
         }
     }
-    ddl
+    for sql in ddl {
+        target.execute_sql(&sql).map_err(|err| post_load_ddl_error(&sql, &err))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn should_apply_post_load_ddl(mode: &str) -> bool {
@@ -2487,6 +2513,31 @@ mod tests {
         assert!(!ddl.iter().any(|sql| sql.contains("ux_cr_industry_briefs_slug")));
         assert!(ddl.iter().any(|sql| sql.contains("cr_industry_map_ibfk_1")));
 
+    }
+
+    #[test]
+    fn complete_imported_table_adds_each_foreign_key_once_both_tables_are_done() {
+        use crate::adapters::test_support::{empty_table, fk};
+        let mut parent = empty_table("parent", vec![fk("parent_cycle", "child")]);
+        parent.indexes.push(NormalizedIndex {
+            name: "idx_parent".into(), columns: vec!["parent_id".into()], column_prefixes: vec![None],
+            unique: false, visible: None, spatial: false,
+        });
+        let child = empty_table("child", vec![fk("child_parent", "parent"), fk("child_self", "child"), fk("child_outside", "users")]);
+        let schema = NormalizedSchema { tables: vec![parent.clone(), child.clone()] };
+        let mut adapter = RecordingAdapter::default();
+        let mut completed = std::collections::BTreeSet::new();
+
+        complete_imported_table(&mut adapter, &schema, &parent, &mut completed, "mysql").unwrap();
+        // The cycle back to child waits until child is done.
+        assert_eq!(adapter.executed_sql, vec!["CREATE INDEX `idx_parent` ON `parent` (`parent_id`);".to_string()]);
+
+        adapter.executed_sql.clear();
+        complete_imported_table(&mut adapter, &schema, &child, &mut completed, "mysql").unwrap();
+        let constraints: Vec<&str> = adapter.executed_sql.iter()
+            .map(|sql| sql.split(" ADD CONSTRAINT ").nth(1).unwrap().split(' ').next().unwrap()).collect();
+        // A parent outside the import set (users) counts as done; nothing is added twice.
+        assert_eq!(constraints, vec!["`parent_cycle`", "`child_parent`", "`child_self`", "`child_outside`"]);
     }
 
     #[test]

@@ -130,6 +130,28 @@ def test_export_failure_cancel_and_incomplete_choice_statuses(history, cancel, i
         dialog.close()
 
 
+@pytest.mark.parametrize("mode, incomplete, actual", [
+    ("parallel_table_lock", False, "전체 · 테이블 락 공유 스냅샷(병렬) · zstd 압축 · 스레드 8"),
+    ("parallel_unsynchronized", True,
+     "전체 · 독립 스냅샷(병렬, 시점 일관성 미보장) · zstd 압축 · 스레드 8 · 불완전 Export(일부 객체 제외)"),
+    ("single_connection", False, "전체 · 일관 스냅샷(단일 연결) · zstd 압축 · 스레드 1"),
+])
+def test_export_retry_records_the_mode_that_actually_ran(history, mode, incomplete, actual):
+    dialog = make_export()
+    try:
+        dialog.spin_threads.setValue(8)
+        start_export(dialog)
+        dialog._snapshot_mode = mode  # the privilege / incomplete retry rebuilt the worker
+        dialog._allow_incomplete = incomplete
+        dialog.on_finished(True, "ok")
+        record = only(history)
+        assert record.mode == actual, "the mode column shows the mode that actually ran"
+        assert "actual_mode" not in record.details
+        assert record.rerun["snapshot_mode"] == "parallel_strict"
+    finally:
+        dialog.close()
+
+
 def test_export_retries_stay_one_job_and_a_new_run_starts_a_new_one(history):
     dialog = make_export()
     try:

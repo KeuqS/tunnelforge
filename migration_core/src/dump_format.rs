@@ -454,6 +454,9 @@ struct SurvivingFkColumn {
 
 fn mysql_base_column_type(type_name: &str) -> String {
     let lower = type_name.trim().to_ascii_lowercase();
+    // The dump marks AUTO_INCREMENT in the type; the target's COLUMN_TYPE never shows it, and it
+    // does not affect foreign key compatibility.
+    let lower = lower.strip_suffix(" auto_increment").map(str::to_string).unwrap_or(lower);
     [" character set ", " charset ", " collate "]
         .iter()
         .filter_map(|marker| lower.find(marker))
@@ -2306,7 +2309,7 @@ mod tests {
 
     #[test]
     fn incompatible_surviving_fk_is_rejected_before_parent_recreate() {
-        let schema = NormalizedSchema {
+        let mut schema = NormalizedSchema {
             tables: vec![NormalizedTable {
                 name: "supplement_review_item".to_string(),
                 columns: vec![NormalizedColumn {
@@ -2343,6 +2346,10 @@ mod tests {
             incompatible_surviving_fk_offenders(&rows, &schema, false),
             vec!["supplement_review_api_call.fk_srac_item -> supplement_review_item (column id type changes from int unsigned to bigint unsigned)".to_string()]
         );
+
+        // An AUTO_INCREMENT parent keeps the same type for its children.
+        schema.tables[0].columns[0].type_name = "int unsigned auto_increment".to_string();
+        assert!(incompatible_surviving_fk_offenders(&rows, &schema, false).is_empty());
     }
 
     #[test]

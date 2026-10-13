@@ -786,6 +786,18 @@ pub(crate) fn mysql_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, Strin
     })
 }
 
+/// Raises how many warnings SHOW WARNINGS lists. MySQL 8 requires SESSION_VARIABLES_ADMIN
+/// for this, so an account without it keeps the server default (1024). Every warning check
+/// compares SHOW COUNT(*) WARNINGS with the rows it can see, so a lower cap can only refuse
+/// a statement, never hide a warning.
+// Legacy ENUM-zero batches are sized from the session's real cap (import::enum_warning_cap).
+pub(crate) fn raise_mysql_max_error_count(conn: &mut mysql::PooledConn) -> Result<(), mysql::Error> {
+    match conn.query_drop("SET SESSION max_error_count=65535") {
+        Err(mysql::Error::MySqlError(err)) if err.code == 1227 => Ok(()),
+        result => result,
+    }
+}
+
 pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
     mysql::OptsBuilder::new()
         // Pools are private to a single worker/adapter; driver defaults would
@@ -918,17 +930,17 @@ pub(crate) fn dump_manifest_consistency_metadata(
     mysql_snapshot_policy: &str,
 ) -> (String, bool, Vec<String>) {
     if engine == "mysql" {
-        let backup_lock_skipped =
-            mysql_snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot";
-        let warnings = if backup_lock_skipped {
+        let unsynchronized =
+            mysql_snapshot_policy == "mysql_parallel_unsynchronized_snapshots";
+        let warnings = if unsynchronized {
             vec![
-                "Workers used independent snapshots; cross-table and cross-chunk consistency is not guaranteed."
+                "Workers used independent snapshots without a shared lock; cross-table and cross-chunk point-in-time consistency is not guaranteed."
                     .to_string(),
             ]
         } else {
             Vec::new()
         };
-        (mysql_snapshot_policy.to_string(), !backup_lock_skipped, warnings)
+        (mysql_snapshot_policy.to_string(), !unsynchronized, warnings)
     } else {
         ("postgresql_repeatable_read_snapshot".to_string(), true, Vec::new())
     }
@@ -1341,19 +1353,28 @@ mod tests {
     }
 
     #[test]
-    fn dump_manifest_consistency_metadata_marks_parallel_no_backup_lock() {
+    fn dump_manifest_consistency_metadata_marks_table_lock_as_strict() {
+        let (snapshot_policy, strict_export, warnings) =
+            dump_manifest_consistency_metadata("mysql", "mysql_table_lock_shared_snapshot");
+
+        assert_eq!(snapshot_policy, "mysql_table_lock_shared_snapshot");
+        assert!(strict_export);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_consistency_metadata_marks_parallel_unsynchronized_not_strict() {
         let (snapshot_policy, strict_export, warnings) = dump_manifest_consistency_metadata(
             "mysql",
-            "mysql_parallel_no_backup_lock_consistent_snapshot",
+            "mysql_parallel_unsynchronized_snapshots",
         );
 
-        assert_eq!(
-            snapshot_policy,
-            "mysql_parallel_no_backup_lock_consistent_snapshot"
-        );
+        assert_eq!(snapshot_policy, "mysql_parallel_unsynchronized_snapshots");
         assert!(!strict_export);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("independent snapshots"));
+        assert_eq!(
+            warnings,
+            ["Workers used independent snapshots without a shared lock; cross-table and cross-chunk point-in-time consistency is not guaranteed."]
+        );
     }
 
     #[test]
