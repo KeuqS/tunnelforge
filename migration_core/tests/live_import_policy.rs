@@ -418,6 +418,29 @@ fn mysql_incompatible_surviving_foreign_key_refuses_before_replacing_parent() {
 }
 
 #[test]
+fn mysql_replace_keeps_target_only_child_of_an_auto_increment_parent() {
+    // The dump writes the parent key as `int auto_increment`; the target reports `int`.
+    let Some(endpoint) = endpoint() else { return };
+    let mut conn = connect(&endpoint);
+    let parent = unique("tf_fk_ai_parent");
+    let child = unique("tf_fk_ai_child");
+    conn.query_drop(format!("CREATE TABLE {parent}(id INT AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {parent} VALUES(1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_fk_ai"));
+    let exported = run("dump.run", json!({"source":endpoint,"tables":[parent],"output_dir":output,"data_format":"jsonl","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, parent_id INT, FOREIGN KEY(parent_id) REFERENCES {parent}(id)) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {child} VALUES(7,1)")).unwrap();
+    let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
+    let child_fks = conn.query_first::<u64,_>(format!("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='{child}' AND REFERENCED_TABLE_NAME='{parent}'"));
+    conn.query_drop(format!("DROP TABLE {child}")).unwrap();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(child_fks.ok().flatten(), Some(1), "target-only child lost its foreign key");
+}
+
+#[test]
 fn mysql_server_ddl_probe_rejects_before_original_table_is_dropped() {
     let Some(endpoint) = endpoint() else { return };
     let mut conn = connect(&endpoint);
