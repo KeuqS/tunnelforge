@@ -1656,6 +1656,11 @@ def test_replace_failure_details_name_lost_and_untouched_tables():
     assert "orders.fk_orders_users" in details  # orders was never dropped: its original rows remain
     _capture_import_audit(audit, {"event": "import_report", "dropped_tables": ["orders"]})
     assert "orders.fk_orders_users" not in _replace_failure_details(audit)
+    # A child FK the core linked again is no longer listed as removed.
+    _capture_import_audit(audit, {"event": "import_report", "restored_foreign_keys": ["items.fk_items_orders"]})
+    details = _replace_failure_details(audit)
+    assert "원본 테이블에서 제거된 외래 키" not in details
+    assert "다시 연결한 외래 키: items.fk_items_orders" in details
     assert _replace_failure_details({}) == ""
 
 

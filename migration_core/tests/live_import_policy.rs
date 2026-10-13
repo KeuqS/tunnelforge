@@ -603,7 +603,12 @@ fn postgres_replace_failure_keeps_unreached_child_and_reports_its_dropped_fk() {
     let summary = imported.iter().filter(|event| event["event"]=="import_report").last().unwrap();
     assert_eq!(summary["dropped_not_restored_tables"], json!(["parent"]));
     assert_eq!(summary["unattempted_tables"], json!(["child"]));
-    assert_eq!(summary["dropped_foreign_keys"], json!([{"table":"child","constraint":"fk_child_parent","referenced_table":"parent"}]));
+    let dropped = &summary["dropped_foreign_keys"][0];
+    assert_eq!(summary["dropped_foreign_keys"].as_array().unwrap().len(), 1);
+    assert_eq!((&dropped["table"], &dropped["constraint"], &dropped["referenced_table"]), (&json!("child"), &json!("fk_child_parent"), &json!("parent")));
+    assert!(dropped["definition"].as_str().unwrap().contains("REFERENCES"), "{dropped}");
+    // The parent itself failed, so there is nothing to link the child to again.
+    assert_eq!(summary["restored_foreign_keys"], json!([]));
 }
 
 #[test]
@@ -639,23 +644,33 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
     assert!(report["error"].as_str().unwrap().contains("post_load"));
 }
 
-/// Rewrites one table's only chunk so the third table fails, then returns the import events.
-fn import_with_duplicate_third_table(target: &Endpoint, output: &std::path::Path) -> Vec<Value> {
+/// Rewrites one table's only chunk so that table fails, then returns the replace import events.
+fn import_with_rewritten_chunk(target: &Endpoint, output: &std::path::Path, table_name: &str, bytes: &[u8]) -> Vec<Value> {
     use sha2::{Digest, Sha256};
     let path = output.join("_tunnelforge_dump.json");
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let table = manifest["tables"].as_array_mut().unwrap().iter_mut().find(|table| table["name"] == "t3_items").unwrap();
-    let bytes = b"{\"id\":1,\"child_id\":10,\"code\":7}\n{\"id\":2,\"child_id\":11,\"code\":7}\n";
+    let table = manifest["tables"].as_array_mut().unwrap().iter_mut().find(|table| table["name"] == table_name).unwrap();
     std::fs::write(output.join(table["path"].as_str().unwrap()).join("chunk_000001.jsonl"), bytes).unwrap();
     table["chunk_sha256"]["chunk_000001.jsonl"] = json!(format!("{:x}", Sha256::digest(bytes)));
     std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     run("dump.import", json!({"target": target, "input_dir": output, "mode": "replace", "threads": 1}))
 }
 
-fn assert_failed_on_third_table(imported: &[Value]) {
+fn import_with_duplicate_third_table(target: &Endpoint, output: &std::path::Path) -> Vec<Value> {
+    import_with_rewritten_chunk(target, output, "t3_items", b"{\"id\":1,\"child_id\":10,\"code\":7}\n{\"id\":2,\"child_id\":11,\"code\":7}\n")
+}
+
+fn import_report(imported: &[Value]) -> &Value {
+    imported.iter().filter(|event| event["event"] == "import_report").last().unwrap()
+}
+
+fn assert_failed_on(imported: &[Value], table: &str) {
     assert!(!success(imported), "{imported:?}");
-    let summary = imported.iter().filter(|event| event["event"] == "import_report").last().unwrap();
-    assert_eq!(summary["failed_tables"], json!(["t3_items"]), "{summary}");
+    assert_eq!(import_report(imported)["failed_tables"], json!([table]), "{}", import_report(imported));
+}
+
+fn assert_failed_on_third_table(imported: &[Value]) {
+    assert_failed_on(imported, "t3_items");
 }
 
 #[test]
@@ -705,6 +720,61 @@ fn postgres_replace_failure_leaves_earlier_tables_with_their_indexes_and_foreign
     std::fs::remove_dir_all(output).unwrap();
     assert_failed_on_third_table(&imported);
     assert_eq!((index, fk), (1, 1), "the replaced child must keep its index and foreign key");
+}
+
+/// t1_parent and t2_fail have no dependencies, so the order is t1, t2, t3_child: replacing t1
+/// drops the original t3_child's FK, then t2_fail fails before t3_child is reached.
+const UNREACHED_CHILD_FAIL: &[u8] = b"{\"id\":1,\"code\":7}\n{\"id\":2,\"code\":7}\n";
+
+fn assert_unreached_child_keeps_its_fk(imported: &[Value], fk_count: i64, child_rows: i64) {
+    assert_failed_on(imported, "t2_fail");
+    let report = import_report(imported);
+    assert_eq!(report["unattempted_tables"], json!(["t3_child"]), "{report}");
+    assert_eq!(report["restored_foreign_keys"], json!(["t3_child.fk_t3_parent"]), "{report}");
+    assert_eq!((fk_count, child_rows), (1, 2), "the never-reached child must keep its FK and rows");
+}
+
+#[test]
+fn mysql_replace_failure_re_adds_fks_of_children_it_never_reached() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let db = unique("tf_unreached");
+    for sql in [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE TABLE {db}.t1_parent (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.t2_fail (id INT PRIMARY KEY, code INT, UNIQUE KEY uq_t2_code (code))"),
+        format!("CREATE TABLE {db}.t3_child (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_t3_parent FOREIGN KEY (parent_id) REFERENCES {db}.t1_parent (id) ON DELETE CASCADE)"),
+        format!("INSERT INTO {db}.t1_parent VALUES (1),(2)"),
+        format!("INSERT INTO {db}.t2_fail VALUES (1,7),(2,8)"),
+        format!("INSERT INTO {db}.t3_child VALUES (10,1),(11,2)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let target = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let output = std::env::temp_dir().join(unique("tf_unreached"));
+    assert!(success(&run("dump.run", json!({"source": target, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"}))));
+    let imported = import_with_rewritten_chunk(&target, &output, "t2_fail", UNREACHED_CHILD_FAIL);
+    let fk: u64 = root.query_first(format!("SELECT COUNT(*) FROM information_schema.referential_constraints WHERE CONSTRAINT_SCHEMA='{db}' AND CONSTRAINT_NAME='fk_t3_parent' AND DELETE_RULE='CASCADE'")).unwrap().unwrap();
+    let rows: u64 = root.query_first(format!("SELECT COUNT(*) FROM {db}.t3_child")).unwrap().unwrap();
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert_unreached_child_keeps_its_fk(&imported, fk as i64, rows as i64);
+}
+
+#[test]
+fn postgres_replace_failure_re_adds_fks_of_children_it_never_reached() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_unreached");
+    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default() };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.t1_parent(id INT PRIMARY KEY); CREATE TABLE {schema}.t2_fail(id INT PRIMARY KEY, code INT CONSTRAINT uq_t2_code UNIQUE); CREATE TABLE {schema}.t3_child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_t3_parent REFERENCES {schema}.t1_parent(id) ON DELETE CASCADE); INSERT INTO {schema}.t1_parent VALUES(1),(2); INSERT INTO {schema}.t2_fail VALUES(1,7),(2,8); INSERT INTO {schema}.t3_child VALUES(10,1),(11,2)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_unreached"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1}))));
+    let imported = import_with_rewritten_chunk(&endpoint, &output, "t2_fail", UNREACHED_CHILD_FAIL);
+    let fk: i64 = admin.query_one("SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname=$1 AND c.conname='fk_t3_parent' AND c.confdeltype='c'", &[&schema]).unwrap().get(0);
+    let rows: i64 = admin.query_one(&format!("SELECT COUNT(*) FROM {schema}.t3_child"), &[]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert_unreached_child_keeps_its_fk(&imported, fk, rows);
 }
 
 #[test]

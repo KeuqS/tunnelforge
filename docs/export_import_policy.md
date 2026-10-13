@@ -33,7 +33,7 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | --- | --- |
 | `safe` (default) | Restores the complete same-engine dump into a new owned namespace, verifies rows, values and schema, then offers reviewed replacement when supported. Existing namespaces remain unchanged during preparation. |
 | Overwrite (UI) | Runs `safe`, then, after one up-front confirmation, swaps the verified candidate in under the original name with the core's promotion plan; the replaced data stays under a backup name. The swap is automatic only for a `ready_for_switch` restore whose plan is promotable with no blockers; anything else falls back to the reviewed choice. The core receives `mode: safe` and `dump.promote`; there is no separate core mode. |
-| `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data, but may have lost FKs to already replaced parents (reported). |
+| `replace` | Like mysqldump: each selected dump table is dropped, recreated, loaded and finished (its secondary indexes, PostgreSQL unique indexes/comments/sequences) one table at a time; each FK is added as soon as both of its tables are done (a parent outside the dump counts as done), and views follow at the end. Existing selected-table data is lost. A failure leaves at most the table in progress missing, partially loaded or unfinished; tables already replaced are complete, and tables not yet reached keep their original data; an FK such a table lost when its parent was replaced is linked again after the failure if that parent was reloaded (otherwise it stays reported as removed). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 | `merge` | Appends dump rows to compatible existing tables (creates missing tables). It is not synchronization, deduplication, upsert, or change-data capture. Existing keys/FKs can reject rows. Existing MySQL targets must use InnoDB. |
 
@@ -152,8 +152,10 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   already have their indexes and FKs. Data-loaded does not mean views or final
   verification completed. A failed
   `replace` reports `dropped_not_restored_tables` (dropped, not fully reloaded),
-  `unattempted_tables` (original data kept) and `dropped_foreign_keys`; the Import
-  failure dialog lists them, including FKs removed from untouched original tables.
+  `unattempted_tables` (original data kept), `dropped_foreign_keys` (with each
+  original definition) and `restored_foreign_keys` (dropped child FKs linked again
+  after the failure); the Import failure dialog lists them, including FKs still
+  missing from untouched original tables.
 - UI subset retry is disabled: retrying only unfinished tables could leave earlier
   tables without deferred constraints. Inspect the partial target and rerun the
   full original selected scope from the dump with explicit confirmation. Never

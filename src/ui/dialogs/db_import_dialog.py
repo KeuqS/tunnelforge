@@ -65,7 +65,8 @@ def _capture_import_audit(audit: dict, event: dict):
         for key in ("status", "report_path"):
             if isinstance(event.get(key), str):
                 audit[key] = event[key]
-        for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys"):
+        for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys",
+                    "restored_foreign_keys"):
             if isinstance(event.get(key), list):
                 audit[key] = event[key]
 
@@ -104,13 +105,16 @@ def _replace_failure_details(audit: dict) -> str:
     # A child that was never dropped (unattempted, or failed before its own DROP)
     # still holds its original rows but lost the FK to an already replaced parent.
     dropped = set(audit.get("dropped_tables") or [])
+    restored = sorted(name for name in audit.get("restored_foreign_keys") or [] if isinstance(name, str))
     unlinked = sorted({
         f"{fk.get('table')}.{fk.get('constraint')}"
         for fk in audit.get("dropped_foreign_keys") or []
         if isinstance(fk, dict) and isinstance(fk.get("table"), str) and fk["table"] not in dropped
-    })
+    } - set(restored))
     if unlinked:
         lines.append(translate_text("원본 테이블에서 제거된 외래 키: {}").format(_names_preview(unlinked)))
+    if restored:
+        lines.append(translate_text("다시 연결한 외래 키: {}").format(_names_preview(restored)))
     return "\n".join(lines)
 
 
