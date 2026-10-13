@@ -162,10 +162,24 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
 
 ## Snapshot, time and parallelism
 
-- Strict parallel MySQL export uses a shared consistent InnoDB snapshot and
-  requires the corresponding lock privileges. The privilege fallback is an
-  explicitly selected single-connection snapshot. The old no-backup-lock option
-  now uses one worker, not independent inconsistent snapshots.
+- MySQL export snapshot modes (`mysql_snapshot_mode` of `dump.run`):
+
+  | Mode | Privileges | Behavior | Manifest |
+  | --- | --- | --- | --- |
+  | `parallel_strict` (default) | RELOAD (or FLUSH_TABLES), BACKUP_ADMIN | All workers open one shared consistent InnoDB snapshot under `FLUSH TABLES WITH READ LOCK` + `LOCK INSTANCE FOR BACKUP`; the global read lock is acquired within a 2-second limit and released right after the snapshot opens, while DDL stays blocked until the export ends. | `mysql_shared_consistent_snapshot`, `strict_export=true` |
+  | `parallel_table_lock` | LOCK TABLES, SELECT | `LOCK TABLES ... READ` on exactly the exported tables (2-second wait limit) while every worker opens its consistent snapshot, then `UNLOCK TABLES` before any data is read. Writes to those tables wait during that moment. Same point-in-time guarantee as strict; DDL changes are checked after the dump. | `mysql_table_lock_shared_snapshot`, `strict_export=true` |
+  | `parallel_unsynchronized` | none beyond SELECT | Explicit opt-in. Each worker takes its own snapshot without any lock, so cross-table and cross-chunk point-in-time consistency is **not** guaranteed. | `mysql_parallel_unsynchronized_snapshots`, `strict_export=false`, persistent warning; Import reports it again |
+  | `single_connection` | none beyond SELECT | One connection, one consistent snapshot, one worker. | `mysql_single_connection_consistent_snapshot`, `strict_export=true` |
+  | `parallel_no_backup_lock` | none beyond SELECT | Kept for API compatibility; runs like `single_connection`. | same as `single_connection` |
+
+  When `parallel_strict` is refused for missing privileges, the Export dialog asks
+  once: continue in parallel with the table lock (recommended, default), continue
+  in parallel without point-in-time consistency, continue with one connection, or
+  cancel. If the table-lock retry is refused because LOCK TABLES is also missing,
+  it asks a second and last time with only one connection (default) or
+  unsynchronized parallel. A new export starts from `parallel_strict` again, and
+  re-opening an export from the job list never reuses a recorded snapshot mode.
+  Granting RELOAD and BACKUP_ADMIN avoids the question.
 - PostgreSQL table export uses one read-only repeatable-read transaction and
   locks exported tables against destructive DDL. Nullable UNIQUE columns are not
   used as keyset cursors. Large keyless MySQL tables use a single streaming read.
@@ -226,8 +240,10 @@ Default behavior: when the selected scope contains any refused object, `dump.run
 fails before the target directory or any dump file is created, with
 `error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
 object) and `bypassable`. Only the waivable objects can be omitted, and only by
-the explicit choice "table data only (incomplete)" (`allow_incomplete: true` in the
-`dump.run` payload; the UI asks after showing the object list). That choice
+the explicit choice "Export without these objects (incomplete)" (`allow_incomplete:
+true` in the `dump.run` payload; the UI lists the objects, up to 10 inline plus a
+count of the rest, before asking). The structure and data of all remaining tables
+are still exported; only the listed objects are left out. That choice
 keeps `strict_export=false` and adds a persistent `Object not exported: ...`
 warning per object. Lossy table definitions (`bypassable: false`) cannot be
 waived. Scheduled backups have no such prompt and therefore fail with the

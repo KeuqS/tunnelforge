@@ -311,6 +311,57 @@ class TestRustDumpExporter:
         assert facade.payload["mysql_snapshot_mode"] == "parallel_no_backup_lock"
         assert "락 없는 병렬" in message
 
+    @pytest.mark.parametrize("mode, policy, suffix", [
+        (
+            "parallel_table_lock",
+            "mysql_table_lock_shared_snapshot",
+            " (MySQL 테이블 락 공유 스냅샷, 8개 워커)",
+        ),
+        (
+            "parallel_unsynchronized",
+            "mysql_parallel_unsynchronized_snapshots",
+            " (MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장, 8개 워커)",
+        ),
+    ])
+    def test_new_parallel_snapshot_modes_keep_threads_and_name_the_policy(
+        self, tmp_path, mode, policy, suffix
+    ):
+        from src.exporters.rust_dump_exporter import (
+            MYSQL_SNAPSHOT_MODES, RustDumpConfig, RustDumpExporter,
+        )
+
+        facade = MagicMock()
+        facade.run_dump.return_value = {
+            "success": True, "tables": 1, "rows_dumped": 2, "snapshot_policy": policy,
+        }
+        exporter = RustDumpExporter(
+            RustDumpConfig("localhost", 3306, "root", "password"), facade=facade
+        )
+
+        success, message = exporter.export_full_schema(
+            "app", str(tmp_path / "dump"), threads=8, mysql_snapshot_mode=mode
+        )
+
+        payload = facade.run_dump.call_args.args[0]
+        assert mode in MYSQL_SNAPSHOT_MODES
+        assert success is True
+        assert payload["threads"] == 8
+        assert payload["mysql_snapshot_mode"] == mode
+        assert message.endswith(suffix)
+
+    def test_denied_privilege_extracts_lock_tables_from_marker(self):
+        from src.exporters.rust_dump_exporter import (
+            MYSQL_PRIVILEGE_LOCK_TABLES,
+            mysql_parallel_snapshot_denied_privilege,
+        )
+
+        assert MYSQL_PRIVILEGE_LOCK_TABLES == "LOCK_TABLES"
+        assert mysql_parallel_snapshot_denied_privilege(
+            "Rust DB Core export 오류: "
+            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:LOCK_TABLES:"
+            "ERROR 1044 (42000): Access denied for user 'u'@'%' to database 'app'"
+        ) == MYSQL_PRIVILEGE_LOCK_TABLES
+
     def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
         """압축 선택이 Rust dump.run payload로 전달됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter

@@ -28,14 +28,19 @@ DEFAULT_DUMP_COMPRESSION = "zstd"
 MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED = (
     "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED"
 )
-MYSQL_SNAPSHOT_MODES = frozenset(
-    {"parallel_strict", "parallel_no_backup_lock", "single_connection"}
-)
-# FTWRL(글로벌 read lock) 단계에서 거부되면 병렬 스냅샷 자체가 불가능하고,
-# BACKUP_ADMIN(LOCK INSTANCE FOR BACKUP) 단계에서만 거부되면 백업 락을 생략한
-# 단일 연결 스냅샷(parallel_no_backup_lock 호환 모드)으로 우회할 수 있다.
+MYSQL_SNAPSHOT_MODES = frozenset({
+    "parallel_strict",
+    "parallel_table_lock",
+    "parallel_unsynchronized",
+    "parallel_no_backup_lock",
+    "single_connection",
+})
+# 권한 거부 마커의 권한 이름. parallel_strict 는 FTWRL(RELOAD)과
+# LOCK INSTANCE FOR BACKUP(BACKUP_ADMIN)을, parallel_table_lock 은
+# 내보낼 테이블의 LOCK TABLES ... READ 를 필요로 한다.
 MYSQL_PRIVILEGE_BACKUP_ADMIN = "BACKUP_ADMIN"
 MYSQL_PRIVILEGE_FLUSH_OR_RELOAD = "FLUSH_TABLES_OR_RELOAD"
+MYSQL_PRIVILEGE_LOCK_TABLES = "LOCK_TABLES"
 
 
 def is_mysql_parallel_snapshot_privilege_error(message: object) -> bool:
@@ -345,6 +350,12 @@ class RustDumpExporter(_RustDumpClientBase):
         elif snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot":
             message += (
                 f" (MySQL 락 없는 병렬 스냅샷, {effective_threads}개 워커)"
+            )
+        elif snapshot_policy == "mysql_table_lock_shared_snapshot":
+            message += f" (MySQL 테이블 락 공유 스냅샷, {effective_threads}개 워커)"
+        elif snapshot_policy == "mysql_parallel_unsynchronized_snapshots":
+            message += (
+                f" (MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장, {effective_threads}개 워커)"
             )
         elif snapshot_policy == "mysql_single_connection_consistent_snapshot":
             message += " (MySQL 단일 연결 일관 스냅샷)"

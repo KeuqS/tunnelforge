@@ -110,6 +110,9 @@ fn source_dump_warnings(manifest: &DumpManifest) -> Vec<String> {
     if manifest.snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot" {
         warnings.push("legacy source dump used independent snapshots; cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
     }
+    if manifest.snapshot_policy == "mysql_parallel_unsynchronized_snapshots" {
+        warnings.push("source dump was exported by parallel workers with independent snapshots and no shared lock (explicit opt-in); cross-table and cross-chunk point-in-time consistency is not guaranteed, regardless of its strict_export flag".into());
+    }
     if !manifest.strict_export {
         warnings.push("source dump is not marked strict; its recorded fidelity and consistency limitations remain after import".into());
     }
@@ -2095,6 +2098,13 @@ mod tests {
         manifest.strict_export = true;
         manifest.manifest_warnings.clear();
         assert!(source_dump_warnings(&manifest).is_empty());
+        manifest.snapshot_policy = "mysql_table_lock_shared_snapshot".into();
+        assert!(source_dump_warnings(&manifest).is_empty());
+        // Even a hand-edited strict flag cannot hide the unsynchronized opt-in.
+        manifest.snapshot_policy = "mysql_parallel_unsynchronized_snapshots".into();
+        let warnings = source_dump_warnings(&manifest);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("independent snapshots and no shared lock"));
     }
 
     #[test]

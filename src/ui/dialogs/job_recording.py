@@ -30,22 +30,29 @@ _SNAPSHOT_LABELS = {
     "parallel_strict": "일관 스냅샷(병렬)",
     "single_connection": "일관 스냅샷(단일 연결)",
     "parallel_no_backup_lock": "락 없는 스냅샷(단일 워커)",
+    "parallel_table_lock": "테이블 락 공유 스냅샷(병렬)",
+    "parallel_unsynchronized": "독립 스냅샷(병렬, 시점 일관성 미보장)",
 }
 _COMPRESSION_LABELS = {"none": "압축 안 함", "zstd": "zstd 압축"}
+
+
+def _export_mode(dialog) -> str:
+    scope = "전체" if dialog.radio_full.isChecked() else f"테이블 {len(dialog.get_selected_tables())}개"
+    compression = dialog.combo_compression.currentText()
+    threads = 1 if dialog._snapshot_mode == "single_connection" else dialog.spin_threads.value()
+    return (f"{scope}"
+            f" · {_SNAPSHOT_LABELS.get(dialog._snapshot_mode, dialog._snapshot_mode)}"
+            f" · {_COMPRESSION_LABELS.get(compression, compression)} · 스레드 {threads}"
+            + (" · 불완전 Export(일부 객체 제외)" if dialog._allow_incomplete else ""))
 
 
 def begin_export_job(dialog) -> Optional[str]:
     try:
         full = dialog.radio_full.isChecked()
         tables = [] if full else list(dialog.get_selected_tables())
-        compression = dialog.combo_compression.currentText()
-        mode = (f"{'전체' if full else f'테이블 {len(tables)}개'}"
-                f" · {_SNAPSHOT_LABELS.get(dialog._snapshot_mode, dialog._snapshot_mode)}"
-                f" · {_COMPRESSION_LABELS.get(compression, compression)} · 스레드 {dialog.spin_threads.value()}"
-                + (" · 불완전 Export(테이블 데이터만)" if dialog._allow_incomplete else ""))
         return job_begin(
             KIND_EXPORT_FULL if full else KIND_EXPORT_TABLES,
-            target=dialog.export_schema, mode=mode,
+            target=dialog.export_schema, mode=_export_mode(dialog),
             rerun={"schema": dialog.export_schema, "scope": "full" if full else "tables", "tables": tables,
                    "compression": dialog.combo_compression.currentText(),
                    "threads": dialog.spin_threads.value(),
@@ -70,7 +77,8 @@ def finish_export_job(dialog, success: bool, message: str) -> None:
             status = STATUS_FAILED
         output = dialog.input_output_dir.text()
         details = {"tables": int(dialog.export_total_tables or 0), "rows": int(sum(dialog.export_table_done.values()))}
-        job_finish(job_id, status, error="" if success else message,
+        # begin은 첫 실행(parallel_strict) 모드로 기록되므로, 권한 대체·불완전 선택으로 다시 실행했으면 실제 모드로 바꾼다.
+        job_finish(job_id, status, error="" if success else message, mode=_export_mode(dialog),
                    report_path=os.path.join(output, DUMP_MANIFEST_NAME) if output else "", details=details)
     except Exception:
         pass
