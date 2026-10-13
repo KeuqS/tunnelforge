@@ -47,7 +47,15 @@ because re-creating the parent would otherwise fail (ERROR 1822/6125) right afte
 the drop. FKs between selected tables are dropped from the not-yet-replaced child
 just before its parent is replaced and recreated from the dump after loading.
 Unsupported target actions, including MySQL `SET DEFAULT` foreign keys, fail
-preflight.
+preflight. AUTO_INCREMENT on a parent key is not a type change for this check.
+
+Before any table is dropped, the target server checks the import itself: every
+selected table is created once under a temporary probe name, for `replace` with
+its indexes and foreign keys (an FK to a table outside the dump points at the
+live target table), and all probes are then removed. A rejected definition, a
+missing REFERENCES privilege, or an FK that no longer fits a parent outside the
+dump stops the import with the target unchanged. A view or other non-table
+object that already uses a selected table's name is refused the same way.
 
 ### Safe restoration and destination names
 

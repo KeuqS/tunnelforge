@@ -143,7 +143,7 @@ pub fn generate_schema_ddl(
 }
 
 /// Secondary indexes created after the table's data (MySQL unique keys come with CREATE TABLE).
-fn secondary_index_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
+pub(crate) fn secondary_index_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
     let mut ddl = Vec::new();
     for index in &table.indexes {
         if index.columns.is_empty() {
@@ -183,7 +183,7 @@ fn secondary_index_ddl(table: &NormalizedTable, target: &str) -> Vec<String> {
     ddl
 }
 
-fn foreign_key_ddl(table: &str, fk: &NormalizedForeignKey, target: &str) -> Option<String> {
+pub(crate) fn foreign_key_ddl(table: &str, fk: &NormalizedForeignKey, target: &str) -> Option<String> {
     if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
         return None;
     }
