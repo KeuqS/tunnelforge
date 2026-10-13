@@ -639,6 +639,74 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
     assert!(report["error"].as_str().unwrap().contains("post_load"));
 }
 
+/// Rewrites one table's only chunk so the third table fails, then returns the import events.
+fn import_with_duplicate_third_table(target: &Endpoint, output: &std::path::Path) -> Vec<Value> {
+    use sha2::{Digest, Sha256};
+    let path = output.join("_tunnelforge_dump.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let table = manifest["tables"].as_array_mut().unwrap().iter_mut().find(|table| table["name"] == "t3_items").unwrap();
+    let bytes = b"{\"id\":1,\"child_id\":10,\"code\":7}\n{\"id\":2,\"child_id\":11,\"code\":7}\n";
+    std::fs::write(output.join(table["path"].as_str().unwrap()).join("chunk_000001.jsonl"), bytes).unwrap();
+    table["chunk_sha256"]["chunk_000001.jsonl"] = json!(format!("{:x}", Sha256::digest(bytes)));
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    run("dump.import", json!({"target": target, "input_dir": output, "mode": "replace", "threads": 1}))
+}
+
+fn assert_failed_on_third_table(imported: &[Value]) {
+    assert!(!success(imported), "{imported:?}");
+    let summary = imported.iter().filter(|event| event["event"] == "import_report").last().unwrap();
+    assert_eq!(summary["failed_tables"], json!(["t3_items"]), "{summary}");
+}
+
+#[test]
+fn mysql_replace_failure_leaves_earlier_tables_with_their_indexes_and_foreign_keys() {
+    let _guard = MYSQL_GLOBAL_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(endpoint) = endpoint() else { return };
+    let mut root = connect(&endpoint);
+    let db = unique("tf_per_table");
+    for sql in [
+        format!("CREATE DATABASE {db}"),
+        format!("CREATE TABLE {db}.t1_parent (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.t2_child (id INT PRIMARY KEY, parent_id INT, KEY idx_t2_parent (parent_id), CONSTRAINT fk_t2_parent FOREIGN KEY (parent_id) REFERENCES {db}.t1_parent (id))"),
+        // t3 references t2 so it is replaced last. MySQL creates unique keys with the table,
+        // so duplicate rows fail while loading t3.
+        format!("CREATE TABLE {db}.t3_items (id INT PRIMARY KEY, child_id INT, code INT, UNIQUE KEY uq_t3_code (code), CONSTRAINT fk_t3_child FOREIGN KEY (child_id) REFERENCES {db}.t2_child (id))"),
+        format!("INSERT INTO {db}.t1_parent VALUES (1),(2)"),
+        format!("INSERT INTO {db}.t2_child VALUES (10,1),(11,2)"),
+        format!("INSERT INTO {db}.t3_items VALUES (1,10,7),(2,11,8)"),
+    ] { root.query_drop(sql).unwrap(); }
+    let target = Endpoint { database: db.clone(), ..endpoint.clone() };
+    let output = std::env::temp_dir().join(unique("tf_per_table"));
+    assert!(success(&run("dump.run", json!({"source": target, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1, "mysql_snapshot_mode": "single_connection"}))));
+    let imported = import_with_duplicate_third_table(&target, &output);
+    let index: u64 = root.query_first(format!("SELECT COUNT(*) FROM information_schema.statistics WHERE TABLE_SCHEMA='{db}' AND TABLE_NAME='t2_child' AND INDEX_NAME='idx_t2_parent'")).unwrap().unwrap();
+    let fk: u64 = root.query_first(format!("SELECT COUNT(*) FROM information_schema.referential_constraints WHERE CONSTRAINT_SCHEMA='{db}' AND CONSTRAINT_NAME='fk_t2_parent'")).unwrap().unwrap();
+    root.query_drop(format!("DROP DATABASE {db}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert_failed_on_third_table(&imported);
+    assert_eq!((index, fk), (1, 1), "the replaced child must keep its index and foreign key");
+}
+
+#[test]
+fn postgres_replace_failure_leaves_earlier_tables_with_their_indexes_and_foreign_keys() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_per_table_done");
+    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default() };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
+    // t3 references t2 so it is replaced last. PostgreSQL builds the unique index after
+    // t3's rows, so t3 fails while finishing.
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.t1_parent(id INT PRIMARY KEY); CREATE TABLE {schema}.t2_child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_t2_parent REFERENCES {schema}.t1_parent(id)); CREATE INDEX idx_t2_parent ON {schema}.t2_child(parent_id); CREATE TABLE {schema}.t3_items(id INT PRIMARY KEY, child_id INT CONSTRAINT fk_t3_child REFERENCES {schema}.t2_child(id), code INT CONSTRAINT uq_t3_code UNIQUE); INSERT INTO {schema}.t1_parent VALUES(1),(2); INSERT INTO {schema}.t2_child VALUES(10,1),(11,2); INSERT INTO {schema}.t3_items VALUES(1,10,7),(2,11,8)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_per_table_done"));
+    assert!(success(&run("dump.run", json!({"source": endpoint, "output_dir": output, "data_format": "jsonl", "compression": "none", "threads": 1}))));
+    let imported = import_with_duplicate_third_table(&endpoint, &output);
+    let index: i64 = admin.query_one("SELECT COUNT(*) FROM pg_indexes WHERE schemaname=$1 AND indexname='idx_t2_parent'", &[&schema]).unwrap().get(0);
+    let fk: i64 = admin.query_one("SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname=$1 AND c.conname='fk_t2_parent'", &[&schema]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert_failed_on_third_table(&imported);
+    assert_eq!((index, fk), (1, 1), "the replaced child must keep its index and foreign key");
+}
+
 #[test]
 fn postgres_legacy_replace_refuses_dependent_views_before_any_table_drop() {
     let Ok(host)=std::env::var("TF_POSTGRES_HOST") else{return};
