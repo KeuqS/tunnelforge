@@ -134,6 +134,8 @@ struct ImportJournal {
     current_table: Option<String>,
     pending_drop: Option<String>,
     dropped_foreign_keys: Vec<Value>,
+    /// `table.constraint` of dropped child FKs re-added after a failure (child never reached).
+    restored_foreign_keys: Vec<String>,
     rows_imported: u64,
     chunks_imported: u64,
     safe_context: Option<Value>,
@@ -149,6 +151,7 @@ impl ImportJournal {
             "dropped_tables": self.dropped, "data_loaded_tables": self.loaded,
             "dropped_not_restored_tables": self.dropped.iter().filter(|name| !self.loaded.contains(*name)).collect::<Vec<_>>(),
             "dropped_foreign_keys": self.dropped_foreign_keys,
+            "restored_foreign_keys": self.restored_foreign_keys,
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
@@ -193,7 +196,8 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
         load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
-        current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), rows_imported: 0, chunks_imported: 0,
+        current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), restored_foreign_keys: Vec::new(),
+        rows_imported: 0, chunks_imported: 0,
         safe_context,
     };
     // Replacing a prior success report is a prerequisite for starting a new attempt.
@@ -224,7 +228,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
     let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
-    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
+    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "restored_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
         summary[key] = report[key].clone();
     }
     emit(summary);
@@ -485,6 +489,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         }
         Ok(())
     })();
+    if import_result.is_err() {
+        restore_unreached_child_foreign_keys(&mut adapter, journal, request.request_id.clone(), &mut emit);
+    }
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
     let local_infile_restore_result = restore_mysql_local_infile_policy(
         &mut adapter,
@@ -620,12 +627,14 @@ fn replace_target_table<F: FnMut(Value)>(
     }
     let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
     for (child, constraint) in incoming_import_set_foreign_keys(adapter, target_schema, table, planned)? {
+        // Kept so the FK can be re-added if the import stops before the child's own turn.
+        let definition = foreign_key_definition(adapter, target_schema, &child, &constraint)?;
         let engine = adapter.engine();
         let drop_keyword = if engine == "mysql" { "FOREIGN KEY" } else { "CONSTRAINT" };
         let sql = format!("ALTER TABLE {} DROP {drop_keyword} {}", quote_ident(engine, &child), quote_ident(engine, &constraint));
         adapter.execute_sql(&sql)
             .map_err(|err| dump_import_ddl_error("drop_foreign_key", &format!("{child}.{constraint}"), &err))?;
-        journal.dropped_foreign_keys.push(json!({"table": child, "constraint": constraint, "referenced_table": table}));
+        journal.dropped_foreign_keys.push(json!({"table": child, "constraint": constraint, "referenced_table": table, "definition": definition}));
         journal.checkpoint()?;
         emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
             "action":"drop_foreign_key", "status":"completed", "table":child, "constraint":constraint,
@@ -646,6 +655,65 @@ fn replace_target_table<F: FnMut(Value)>(
 
 /// `parent`를 참조하는 같은 스키마 import set 테이블의 FK `(child, constraint)` 목록.
 /// 자기 참조 FK는 테이블과 함께 사라지므로 제외한다.
+/// The target's own `FOREIGN KEY (...) REFERENCES ...` clause for one constraint.
+fn foreign_key_definition(adapter: &mut LiveAdapter, schema: &str, table: &str, constraint: &str) -> Result<String, String> {
+    let inspect_error = |err: &dyn std::fmt::Display| format!("target foreign key definition inspection failed for {table}.{constraint}: {err}");
+    match adapter {
+        LiveAdapter::MySql(conn) => {
+            let columns: Vec<(String, String, String)> = conn.exec(
+                "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
+                 WHERE CONSTRAINT_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_NAME=? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION",
+                (schema, table, constraint),
+            ).map_err(|err| inspect_error(&err))?;
+            let rules: Option<(String, String)> = conn.exec_first(
+                "SELECT DELETE_RULE, UPDATE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
+                (schema, table, constraint),
+            ).map_err(|err| inspect_error(&err))?;
+            let (Some((_, parent, _)), Some((on_delete, on_update))) = (columns.first(), rules) else {
+                return Err(inspect_error(&"constraint not found"));
+            };
+            let list = |pick: fn(&(String, String, String)) -> &String| columns.iter().map(|column| quote_ident("mysql", pick(column))).collect::<Vec<_>>().join(", ");
+            Ok(format!("FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {on_delete} ON UPDATE {on_update}",
+                list(|column| &column.0), quote_ident("mysql", parent), list(|column| &column.2)))
+        }
+        LiveAdapter::PostgreSql(client) => client.query_one(
+            "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid \
+             JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname=$1 AND t.relname=$2 AND c.conname=$3",
+            &[&schema, &table, &constraint],
+        ).map(|row| row.get(0)).map_err(|err| inspect_error(&err)),
+    }
+}
+
+/// After a failed replace, re-adds the FKs taken from children the import never reached, so they
+/// keep their FK as well as their rows. Only parents that were reloaded are linked again; MySQL does
+/// it with foreign_key_checks=0, as the import itself does. Best effort: what fails stays reported
+/// as dropped.
+fn restore_unreached_child_foreign_keys<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter, journal: &mut ImportJournal, request_id: Option<String>, emit: &mut F,
+) {
+    let engine = adapter.engine();
+    if engine == "mysql" && adapter.execute_sql("SET SESSION foreign_key_checks=0").is_err() {
+        return;
+    }
+    for fk in journal.dropped_foreign_keys.clone() {
+        let (Some(child), Some(constraint), Some(parent), Some(definition)) = (
+            fk["table"].as_str(), fk["constraint"].as_str(), fk["referenced_table"].as_str(), fk["definition"].as_str(),
+        ) else { continue };
+        if journal.load_attempted.contains(child) || !journal.loaded.iter().any(|name| name == parent) {
+            continue;
+        }
+        let sql = format!("ALTER TABLE {} ADD CONSTRAINT {} {definition}", quote_ident(engine, child), quote_ident(engine, constraint));
+        let result = adapter.execute_sql(&sql);
+        if result.is_ok() {
+            journal.restored_foreign_keys.push(format!("{child}.{constraint}"));
+        }
+        emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
+            "action":"restore_foreign_key", "status": if result.is_ok() { "completed" } else { "failed" },
+            "table":child, "constraint":constraint, "message": result.err()}));
+    }
+    let _ = journal.checkpoint();
+}
+
 fn incoming_import_set_foreign_keys(
     adapter: &mut LiveAdapter, schema: &str, parent: &str, planned: &BTreeSet<String>,
 ) -> Result<Vec<(String, String)>, String> {
