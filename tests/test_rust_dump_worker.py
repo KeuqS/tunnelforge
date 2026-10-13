@@ -1,8 +1,13 @@
+import pytest
+
 from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 
-def test_export_worker_forwards_single_connection_snapshot_mode(monkeypatch):
+@pytest.mark.parametrize(
+    "mode", ["single_connection", "parallel_table_lock", "parallel_unsynchronized"]
+)
+def test_export_worker_forwards_snapshot_mode(monkeypatch, mode):
     captured = {}
 
     class FakeExporter:
@@ -24,12 +29,12 @@ def test_export_worker_forwards_single_connection_snapshot_mode(monkeypatch):
         schema="app",
         output_dir="C:/tmp/export",
         threads=8,
-        mysql_snapshot_mode="single_connection",
+        mysql_snapshot_mode=mode,
     )
 
     worker._run_export_schema()
 
-    assert captured["kwargs"]["mysql_snapshot_mode"] == "single_connection"
+    assert captured["kwargs"]["mysql_snapshot_mode"] == mode
 
 
 def test_export_worker_forwards_incomplete_choice_and_exposes_refusal(monkeypatch):

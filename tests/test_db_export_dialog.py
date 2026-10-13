@@ -20,6 +20,10 @@ from src.ui.dialogs.db_export_dialog import (
     next_export_percent,
 )
 
+# 모듈 동안 QApplication 을 유지한다. 테스트 지역 변수로만 잡으면 GC 순서에 따라
+# 이후 테스트가 QApplication 없이 위젯을 만들다 프로세스째 중단된다.
+_app = QApplication.instance() or QApplication([])
+
 def test_cap_incomplete_export_percent_prevents_early_100():
     assert cap_incomplete_export_percent(100, completed_tables=35, total_tables=208) == 17
 
@@ -119,25 +123,7 @@ def test_rust_dump_export_dialog_defaults_to_zstd():
     dialog.close()
 
 
-def test_mysql_privilege_dialog_offers_continue_guidance_and_cancel(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    dialog = RustDumpExportDialog()
-
-    try:
-        message_box = dialog._create_mysql_privilege_dialog()
-        button_texts = {button.text() for button in message_box.buttons()}
-
-        assert button_texts == {"단일 연결로 계속", "권한 설정 안내", "취소"}
-        assert message_box.defaultButton().text() == "단일 연결로 계속"
-    finally:
-        dialog.close()
-
-
-def test_mysql_privilege_failure_retries_same_export_with_one_connection(monkeypatch):
+def _privilege_dialog(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.check_rust_dump",
@@ -145,222 +131,325 @@ def test_mysql_privilege_failure_retries_same_export_with_one_connection(monkeyp
     )
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: pytest.fail("privilege failure must offer fallback"),
+        lambda *_args: None,
     )
     dialog = RustDumpExportDialog()
-    worker = MagicMock()
-    worker.isRunning.return_value = False
+    dialog._test_app = app  # keep QApplication alive for the dialog's lifetime
     dialog.export_schema = "app"
     dialog.input_output_dir.setText("C:/tmp/tunnelforge-export")
-    dialog._prompt_mysql_privilege_action = MagicMock(return_value="continue")
-    dialog._build_worker = MagicMock(return_value=worker)
+    dialog.spin_threads.setValue(6)
     dialog._start_export_worker = MagicMock()
     dialog._report_error_anonymously = MagicMock()
+    return dialog
 
+
+def _privilege_marker(privilege):
+    return (
+        "Rust DB Core export 오류: "
+        f"MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:{privilege}:ERROR 1227"
+    )
+
+
+def _buttons_by_name(message_box):
+    return {button.objectName(): button for button in message_box.buttons()}
+
+
+def test_first_mysql_privilege_dialog_recommends_table_lock(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
     try:
-        dialog.on_finished(
-            False,
-            "Rust DB Core export 오류: "
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "FLUSH_TABLES_OR_RELOAD:ERROR 1045",
-        )
+        message_box = dialog._create_mysql_privilege_dialog()
+        buttons = _buttons_by_name(message_box)
 
-        dialog._build_worker.assert_called_once_with(
-            "app",
-            "C:/tmp/tunnelforge-export",
-            mysql_snapshot_mode="single_connection",
-        )
-        dialog._start_export_worker.assert_called_once_with(worker)
-        dialog._report_error_anonymously.assert_not_called()
-        assert dialog._mysql_single_connection_fallback is True
+        assert message_box.windowTitle() == "병렬 Export 권한 필요"
+        assert {name: button.text() for name, button in buttons.items()} == {
+            "mysql_parallel_table_lock_continue": "병렬로 계속 (테이블 락, 권장)",
+            "mysql_parallel_unsynchronized_continue": "병렬로 계속 (시점 일관성 보장 안 함)",
+            "mysql_single_connection_continue": "단일 연결로 계속",
+            "mysql_privilege_cancel": "취소",
+        }
+        assert message_box.defaultButton().objectName() == "mysql_parallel_table_lock_continue"
+        assert message_box.escapeButton().objectName() == "mysql_privilege_cancel"
+        for expected in ("RELOAD", "BACKUP_ADMIN", "최대 2초", "쓰기는 대기"):
+            assert expected in message_box.text()
     finally:
-        dialog.worker = None
         dialog.close()
 
 
-def test_mysql_privilege_guidance_does_not_start_fallback(monkeypatch):
-    app = QApplication.instance() or QApplication([])
+def test_lock_tables_denied_dialog_drops_the_table_lock_option(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    try:
+        message_box = dialog._create_mysql_privilege_dialog(table_lock_denied=True)
+        buttons = _buttons_by_name(message_box)
+
+        assert set(buttons) == {
+            "mysql_single_connection_continue",
+            "mysql_parallel_unsynchronized_continue",
+            "mysql_privilege_cancel",
+        }
+        assert message_box.defaultButton().objectName() == "mysql_single_connection_continue"
+        assert message_box.escapeButton().objectName() == "mysql_privilege_cancel"
+        assert "LOCK TABLES" in message_box.text()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("object_name, expected", [
+    ("mysql_parallel_table_lock_continue", "parallel_table_lock"),
+    ("mysql_parallel_unsynchronized_continue", "parallel_unsynchronized"),
+    ("mysql_single_connection_continue", "single_connection"),
+    ("mysql_privilege_cancel", "cancel"),
+])
+def test_mysql_privilege_prompt_returns_the_mode_of_the_clicked_button(
+    monkeypatch, object_name, expected
+):
+    dialog = _privilege_dialog(monkeypatch)
+    # exec() 대신 버튼을 눌러 모달 대기 없이 선택을 재현한다.
     monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
+        QMessageBox, "exec", lambda box: _buttons_by_name(box)[object_name].click()
     )
-    shown = {}
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.QMessageBox.information",
-        lambda _parent, title, message: shown.update(
-            {"title": title, "message": message}
-        ),
+    try:
+        assert dialog._prompt_mysql_privilege_action() == expected
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("denied", ["BACKUP_ADMIN", "FLUSH_TABLES_OR_RELOAD", ""])
+@pytest.mark.parametrize("mode, threads", [
+    ("parallel_table_lock", 6),
+    ("parallel_unsynchronized", 6),
+    ("single_connection", 1),
+])
+def test_strict_privilege_failure_retries_with_the_chosen_mode(monkeypatch, denied, mode, threads):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._prompt_mysql_privilege_action = MagicMock(return_value=mode)
+    try:
+        dialog.on_finished(False, _privilege_marker(denied))
+
+        dialog._prompt_mysql_privilege_action.assert_called_once_with(False)
+        worker = dialog._start_export_worker.call_args.args[0]
+        assert worker.kwargs["mysql_snapshot_mode"] == mode
+        assert worker.kwargs["threads"] == threads
+        assert worker.kwargs["output_dir"] == "C:/tmp/tunnelforge-export"
+        assert dialog._snapshot_mode == mode
+        dialog._report_error_anonymously.assert_not_called()
+    finally:
+        dialog.close()
+
+
+def test_lock_tables_denial_asks_once_more_and_never_a_third_time(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._prompt_mysql_privilege_action = MagicMock(
+        side_effect=["parallel_table_lock", "parallel_unsynchronized"]
     )
+    try:
+        dialog.on_finished(False, _privilege_marker("BACKUP_ADMIN"))
+        assert dialog._snapshot_mode == "parallel_table_lock"
+        dialog.on_finished(False, _privilege_marker("LOCK_TABLES"))
+        assert dialog._snapshot_mode == "parallel_unsynchronized"
+        dialog.on_finished(False, _privilege_marker("LOCK_TABLES"))
+
+        assert [c.args for c in dialog._prompt_mysql_privilege_action.call_args_list] == [
+            (False,), (True,)
+        ]
+        assert dialog._start_export_worker.call_count == 2
+        dialog._report_error_anonymously.assert_called_once()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("mode, denied", [
+    ("parallel_unsynchronized", "LOCK_TABLES"),
+    ("single_connection", "BACKUP_ADMIN"),
+    ("parallel_table_lock", "BACKUP_ADMIN"),
+])
+def test_modes_after_the_prompts_never_prompt_again(monkeypatch, mode, denied):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._snapshot_mode = mode
+    dialog._prompt_mysql_privilege_action = MagicMock()
+    try:
+        dialog.on_finished(False, _privilege_marker(denied))
+
+        dialog._prompt_mysql_privilege_action.assert_not_called()
+        dialog._start_export_worker.assert_not_called()
+        dialog._report_error_anonymously.assert_called_once()
+    finally:
+        dialog.close()
+
+
+def test_privilege_cancel_stops_without_error_report(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._prompt_mysql_privilege_action = MagicMock(return_value="cancel")
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: pytest.fail("generic warning must not replace privilege guidance"),
+        lambda *_args: pytest.fail("cancel must not show a generic failure"),
     )
-    dialog = RustDumpExportDialog()
-    dialog._prompt_mysql_privilege_action = MagicMock(return_value="guidance")
-    dialog._start_export_worker = MagicMock()
-    dialog._report_error_anonymously = MagicMock()
-
     try:
-        dialog.on_finished(
-            False,
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "BACKUP_ADMIN:ERROR 1227",
-        )
+        dialog.on_finished(False, _privilege_marker("BACKUP_ADMIN"))
 
         dialog._start_export_worker.assert_not_called()
         dialog._report_error_anonymously.assert_not_called()
-        assert "FLUSH_TABLES" in shown["message"]
-        assert "RELOAD" in shown["message"]
-        assert "BACKUP_ADMIN" in shown["message"]
+        assert dialog.export_success is False
     finally:
         dialog.close()
 
 
-def test_single_connection_failure_does_not_prompt_again(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: None,
-    )
-    dialog = RustDumpExportDialog()
-    dialog._mysql_single_connection_fallback = True
-    dialog._prompt_mysql_privilege_action = MagicMock()
-    dialog._report_error_anonymously = MagicMock()
-
-    try:
-        dialog.on_finished(
-            False,
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "BACKUP_ADMIN:ERROR 1227",
-        )
-
-        dialog._prompt_mysql_privilege_action.assert_not_called()
-        dialog._report_error_anonymously.assert_called_once()
-    finally:
-        dialog.close()
-
-
-def test_backup_admin_denial_offers_single_worker_fallback(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    dialog = RustDumpExportDialog()
-
-    try:
-        message_box = dialog._create_mysql_privilege_dialog("BACKUP_ADMIN")
-        button_texts = {button.text() for button in message_box.buttons()}
-
-        assert button_texts == {
-            "락 없이 계속 (단일 워커)",
-            "단일 연결로 계속",
-            "권한 설정 안내",
-            "취소",
-        }
-        assert message_box.defaultButton().text() == "락 없이 계속 (단일 워커)"
-    finally:
-        dialog.close()
-
-
-def test_flush_reload_denial_also_offers_single_worker_fallback(monkeypatch):
-    # RDS의 FTWRL 권한 거부에도 락 없는 단일 워커 모드를 제시한다.
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    dialog = RustDumpExportDialog()
-
-    try:
-        message_box = dialog._create_mysql_privilege_dialog("FLUSH_TABLES_OR_RELOAD")
-        button_texts = {button.text() for button in message_box.buttons()}
-
-        assert button_texts == {
-            "락 없이 계속 (단일 워커)",
-            "단일 연결로 계속",
-            "권한 설정 안내",
-            "취소",
-        }
-        assert message_box.defaultButton().text() == "락 없이 계속 (단일 워커)"
-    finally:
-        dialog.close()
-
-
-def test_backup_admin_failure_retries_with_parallel_no_backup_lock(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: pytest.fail("privilege failure must offer parallel fallback"),
-    )
-    dialog = RustDumpExportDialog()
+def test_new_export_and_rerun_start_from_the_strict_snapshot(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
     worker = MagicMock()
-    worker.isRunning.return_value = False
-    dialog.export_schema = "app"
-    dialog.input_output_dir.setText("C:/tmp/tunnelforge-export")
-    dialog._prompt_mysql_privilege_action = MagicMock(
-        return_value="parallel_no_backup_lock"
-    )
+    worker.isRunning.return_value = False  # a truthy isRunning() makes close() wait on a modal box
     dialog._build_worker = MagicMock(return_value=worker)
-    dialog._start_export_worker = MagicMock()
-    dialog._report_error_anonymously = MagicMock()
-
     try:
-        dialog.on_finished(
-            False,
-            "Rust DB Core export 오류: "
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "BACKUP_ADMIN:ERROR 1227",
-        )
+        dialog.combo_schema.addItem("app")
+        dialog._snapshot_mode = "parallel_unsynchronized"
+        dialog.apply_job_rerun({"schema": "app", "scope": "full", "snapshot_mode": "parallel_unsynchronized"})
+        dialog.do_export()
 
-        dialog._prompt_mysql_privilege_action.assert_called_once_with("BACKUP_ADMIN")
-        dialog._build_worker.assert_called_once_with(
-            "app",
-            "C:/tmp/tunnelforge-export",
-            mysql_snapshot_mode="parallel_no_backup_lock",
-        )
-        dialog._start_export_worker.assert_called_once_with(worker)
-        dialog._report_error_anonymously.assert_not_called()
-        assert dialog._mysql_no_backup_lock_fallback is True
+        assert dialog._snapshot_mode == "parallel_strict"
+        assert "mysql_snapshot_mode" not in dialog._build_worker.call_args.kwargs
     finally:
-        dialog.worker = None
+        dialog.close()
+
+
+def test_unsynchronized_export_completion_warns_about_consistency(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._show_export_done = MagicMock()
+    dialog._snapshot_mode = "parallel_unsynchronized"
+    try:
+        dialog.on_finished(True, "Rust DB Core export 완료")
+
+        shown = dialog._show_export_done.call_args.args[0]
+        assert "테이블 간 시점 일관성이 보장되지 않습니다" in shown
+        visible = [dialog.txt_log.item(i).text() for i in range(dialog.txt_log.count())]
+        assert any("시점 일관성이 보장되지 않습니다" in line for line in visible)
+        assert any("시점 일관성이 보장되지 않습니다" in line for line in dialog.log_entries)
+    finally:
+        dialog.close()
+
+
+def test_consistent_export_completion_has_no_consistency_warning(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._show_export_done = MagicMock()
+    dialog._snapshot_mode = "parallel_table_lock"
+    try:
+        dialog.on_finished(True, "Rust DB Core export 완료")
+
+        assert "시점 일관성" not in dialog._show_export_done.call_args.args[0]
+    finally:
+        dialog.close()
+
+
+def _box_snapshot(box):
+    # 대화상자를 닫으면 자식 QMessageBox 도 삭제되므로 필요한 값만 미리 꺼내 둔다.
+    return {
+        "text": box.text(),
+        "detailed": box.detailedText(),
+        "buttons": {button.objectName(): button.text() for button in box.buttons()},
+        "default": box.defaultButton().objectName() if box.defaultButton() else "",
+    }
+
+
+def _capture_incomplete_prompt(monkeypatch, objects, click_proceed=False):
+    dialog = _privilege_dialog(monkeypatch)
+    captured = []
+
+    def fake_exec(box):
+        captured.append(_box_snapshot(box))
+        if click_proceed:
+            _buttons_by_name(box)["export_incomplete_proceed"].click()
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+    try:
+        answer = dialog._prompt_incomplete_export(objects)
+    finally:
+        dialog.close()
+    return answer, captured[0]
+
+
+def test_incomplete_export_prompt_lists_objects_inline_up_to_ten(monkeypatch):
+    objects = [f"trigger:t:trg{i}" for i in range(12)]
+    answer, box = _capture_incomplete_prompt(monkeypatch, objects)
+
+    assert answer is False
+    text = box["text"]
+    assert "이 객체 없이 내보내기 (불완전)" in text
+    assert "구조와 데이터는 모두 내보냅니다" in text
+    assert "테이블 데이터만" not in text
+    assert all(f"• {name}" in text for name in objects[:10])
+    assert "trg10" not in text and "trg11" not in text
+    assert text.rstrip().endswith("외 2개")
+    assert box["detailed"] == ""
+    assert box["buttons"]["export_incomplete_proceed"] == "이 객체 없이 내보내기 (불완전)"
+    assert box["default"] == "export_incomplete_cancel"
+
+
+def test_incomplete_export_prompt_short_list_and_proceed(monkeypatch):
+    answer, box = _capture_incomplete_prompt(monkeypatch, ["routine:fn"], click_proceed=True)
+
+    assert answer is True
+    assert box["text"].rstrip().endswith("제외할 객체:\n• routine:fn")
+
+
+def test_incomplete_export_completion_says_structure_and_data_were_exported(monkeypatch):
+    dialog = _privilege_dialog(monkeypatch)
+    dialog._show_export_done = MagicMock()
+    dialog._allow_incomplete = True
+    try:
+        dialog.on_finished(True, "ok")
+
+        shown = dialog._show_export_done.call_args.args[0]
+        assert "일부 객체를 제외한 불완전 Export" in shown
+        assert "구조와 데이터는 모두 내보냈으며" in shown
+    finally:
         dialog.close()
 
 
-def test_parallel_no_backup_lock_failure_does_not_prompt_again(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.check_rust_dump",
-        lambda: (True, "Rust DB Core OK"),
-    )
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
-        lambda *_args: None,
-    )
-    dialog = RustDumpExportDialog()
-    dialog._mysql_no_backup_lock_fallback = True
-    dialog._prompt_mysql_privilege_action = MagicMock()
-    dialog._report_error_anonymously = MagicMock()
+def test_new_export_strings_have_english_translations(monkeypatch):
+    from src.core import i18n
+    from src.ui.dialogs import db_export_dialog as module
+    from src.ui.dialogs.job_recording import _SNAPSHOT_LABELS
 
+    def has_hangul(value):
+        return any("\uac00" <= char <= "\ud7a3" for char in value)
+
+    dialog = _privilege_dialog(monkeypatch)
     try:
-        dialog.on_finished(
-            False,
-            "MYSQL_PARALLEL_SNAPSHOT_PRIVILEGE_REQUIRED:"
-            "BACKUP_ADMIN:ERROR 1227",
-        )
-
-        dialog._prompt_mysql_privilege_action.assert_not_called()
-        dialog._report_error_anonymously.assert_called_once()
+        boxes = [
+            _box_snapshot(dialog._create_mysql_privilege_dialog()),
+            _box_snapshot(dialog._create_mysql_privilege_dialog(table_lock_denied=True)),
+        ]
+        korean = [box["text"] for box in boxes] + ["병렬 Export 권한 필요", "일관 병렬 Export 불가"]
+        korean += [label for label, _mode in module._MYSQL_PRIVILEGE_CHOICES.values()]
+        korean += [text for pair in module._MYSQL_RETRY_MESSAGES.values() for text in pair]
+        korean += [
+            f"✅ Export가 완료되었습니다.\n\n폴더: C:/x\n\n⚠️ {module._UNSYNCHRONIZED_EXPORT_WARNING}"
+            f"\n\n⚠️ {module._INCOMPLETE_EXPORT_WARNING}",
+            "이 객체 없이 내보내기 (불완전)",
+            "사용자가 '이 객체 없이 내보내기 (불완전)'를 선택했습니다.",
+            "일부 객체를 제외한 Export (불완전) 진행 중...",
+            _SNAPSHOT_LABELS["parallel_table_lock"],
+            _SNAPSHOT_LABELS["parallel_unsynchronized"],
+            " · 불완전 Export(일부 객체 제외)",
+            "MySQL 테이블 락 공유 스냅샷",
+            "MySQL 병렬 독립 스냅샷 · 시점 일관성 미보장",
+        ]
+        i18n.set_language("en")
+        translated = {text: i18n.translate_text(text) for text in korean}
+        english = []
+        monkeypatch.setattr(QMessageBox, "exec", lambda box: english.append(_box_snapshot(box)))
+        dialog._prompt_incomplete_export([f"trigger:t:trg{i}" for i in range(11)])
+        english += [
+            _box_snapshot(dialog._create_mysql_privilege_dialog()),
+            _box_snapshot(dialog._create_mysql_privilege_dialog(table_lock_denied=True)),
+        ]
     finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
         dialog.close()
+
+    assert [f"{source!r} -> {result!r}" for source, result in translated.items() if has_hangul(result)] == []
+    for box in english:
+        assert not any(has_hangul(text) for text in box["buttons"].values()), box["buttons"]
+    assert "Export without these objects (incomplete)" in english[0]["text"]
+    assert english[0]["text"].endswith("and 1 more")
 
 
 def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):

@@ -196,7 +196,7 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 
 - Review the [Export/Import contract](docs/export_import_policy.md) before restoring a backup
 - Use **table selection** to export only what you need
-- MySQL shared-snapshot export supports parallel workers; privilege fallback and PostgreSQL use one consistent session
+- MySQL export runs parallel workers on one shared snapshot; without RELOAD/BACKUP_ADMIN it can keep that guarantee by locking only the exported tables for up to 2 seconds (LOCK TABLES), or fall back to one connection. PostgreSQL uses one consistent session
 - Dumps use manifest v3 (**TunnelForge 2.6.0+**); dumps with MySQL BIT columns are v4 (**2.12.2+**); dumps with MySQL spatial columns (GEOMETRY, POINT, ...) are v5 (**2.12.4+**); existing v1/v2 dumps remain readable
 - **Re-export** these older backups: backups taken before 2.12.1 of tables keyed by BINARY/VARBINARY/BYTEA, MySQL ENUM keys, or composite keys containing a backslash; backups with MySQL BIT columns taken before 2.12.2; backups with MySQL spatial columns taken before 2.12.4 (older spatial dumps are refused on import with a re-export message)
 
