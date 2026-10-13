@@ -378,6 +378,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             "message":"서버에서 테이블 생성 정의를 검증 중입니다. 기존 대상 테이블은 아직 변경하지 않습니다."}));
         if matches!(mode, "replace" | "recreate") {
             validate_postgres_drop_dependencies(&mut adapter, &target_schema, &tables)?;
+            // Foreign keys are now added table by table, so refuse incompatible ones before any DROP.
+            validate_foreign_key_column_compatibility(&import_schema)?;
         }
         validate_target_check_names(&mut adapter, &target_schema, &import_schema)?;
         probe_import_ddl(&mut adapter, &import_schema, &manifest.source_engine, journal)?;
@@ -396,6 +398,8 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
         )?;
 
         let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+        let target_engine = adapter.engine();
+        let mut completed_tables = BTreeSet::new();
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
                 .schema
@@ -462,6 +466,12 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             journal.loaded.push(table.name.clone());
             journal.rows_imported = rows_imported;
             journal.chunks_imported = chunks_imported;
+            if should_apply_post_load_ddl(mode) {
+                // Finish this table now, so a later failure leaves every earlier table complete.
+                journal.phase = "dump_import_post_load".into();
+                journal.checkpoint()?;
+                complete_imported_table(&mut adapter, &import_schema, table, &mut completed_tables, target_engine)?;
+            }
             journal.current_table = None;
             journal.checkpoint()?;
             emit(json!({
@@ -495,7 +505,6 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
     finalize_dump_import(
         &mut adapter,
         &manifest,
-        &import_schema,
         &tables,
         &imported_rows_by_table,
         input_dir,
@@ -856,7 +865,6 @@ fn import_table_rows<F: FnMut(Value)>(
 fn finalize_dump_import<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
     manifest: &DumpManifest,
-    import_schema: &NormalizedSchema,
     tables: &[DumpTableManifest],
     imported_rows_by_table: &BTreeMap<String, u64>,
     input_dir: &str,
@@ -873,14 +881,14 @@ fn finalize_dump_import<F: FnMut(Value)>(
     let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     if should_apply_post_load_ddl(mode) {
+        // Indexes and foreign keys were created right after each table's data.
         emit(json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import_post_load",
-            "message": "현재 단계: 인덱스/FK 생성 중 - 데이터 Import는 완료, 후처리 진행 중",
-            "strategy": "post_load_ddl"
+            "message": "현재 단계: 마무리 확인 중 - 인덱스/FK는 테이블마다 적재 직후 생성했습니다",
+            "strategy": "per_table_post_load"
         }));
-        apply_post_load_ddl(adapter, import_schema, &target_engine)?;
     } else {
         emit(json!({
             "event": "phase",
