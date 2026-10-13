@@ -275,7 +275,8 @@ impl InspectAdapter for MysqlInspectAdapter {
             "SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE,tc.ENFORCED FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=? AND tc.TABLE_NAME=? AND tc.CONSTRAINT_TYPE='CHECK' ORDER BY tc.CONSTRAINT_NAME",
             (schema,&table.name)
         ).map_err(|err| format!("mysql CHECK inspect error: {err}"))?;
-        table.checks = checks.into_iter().map(|(name,expression,enforced)| NormalizedCheck {name,expression,enforced:enforced=="YES"}).collect();
+        // An undecodable clause stays raw; the unsafe-CHECK gate then refuses it.
+        table.checks = checks.into_iter().map(|(name,expression,enforced)| NormalizedCheck {name,expression:mysql_check_clause(&expression).unwrap_or(expression),enforced:enforced=="YES"}).collect();
         let visibility: Vec<(String,String,String)> = self.conn.exec(
             "SELECT DISTINCT INDEX_NAME,IS_VISIBLE,INDEX_TYPE FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND TABLE_NAME=?", (schema,&table.name)
         ).map_err(|err| format!("mysql index visibility inspect error: {err}"))?;
@@ -489,7 +490,7 @@ fn inspect_mysql_unsupported_objects(
         "SELECT tc.TABLE_NAME,tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM information_schema.table_constraints tc JOIN information_schema.check_constraints cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=? AND tc.CONSTRAINT_TYPE='CHECK'",
         (database,),
     ).map_err(|err| format!("mysql check inspect error: {err}"))?;
-    objects.extend(checks.into_iter().filter(|(_,_,expression)| !is_safe_check_expression(expression)).map(|(table, name,_)| format!("check_constraint:{table}:{name}")));
+    objects.extend(checks.into_iter().filter(|(_,_,expression)| !mysql_check_clause(expression).is_some_and(|clause| is_safe_check_expression(&clause))).map(|(table, name,_)| format!("check_constraint:{table}:{name}")));
     let indexes: Vec<(String, String)> = conn.exec(
         "SELECT DISTINCT TABLE_NAME, INDEX_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA=? AND (COLUMN_NAME IS NULL OR COLLATION='D' OR INDEX_TYPE NOT IN ('BTREE','HASH','SPATIAL'))",
         (database,),
@@ -501,6 +502,25 @@ fn inspect_mysql_unsupported_objects(
     ).map_err(|err| format!("mysql cross-schema FK inspect error: {err}"))?;
     objects.extend(foreign_keys.into_iter().map(|(table, name)| format!("cross_schema_fk:{table}:{name}")));
     Ok(objects)
+}
+
+/// MySQL's information_schema CHECK_CLAUSE is the printed expression with each
+/// byte widened to a char (binary -> utf8, so non-ASCII literals come back
+/// double-encoded) and then backslash-escaped like a quoted string; SHOW CREATE
+/// TABLE has the real text. Undo both. None when the bytes are not UTF-8
+/// (e.g. a `_latin1` literal), so the caller fails closed.
+// ponytail: MySQL-only format. MariaDB returns the plain clause (its inspect
+// already fails on tc.ENFORCED); gate on VERSION() if MariaDB is ever supported.
+pub(crate) fn mysql_check_clause(raw: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        let ch = if ch == '\\' {
+            match chars.next()? { '0' => '\0', 'n' => '\n', 'r' => '\r', 'Z' => '\x1a', other => other }
+        } else { ch };
+        bytes.push(u8::try_from(u32::from(ch)).ok()?);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn inspect_mysql_deprecated_engines_sql() -> &'static str {
@@ -1223,6 +1243,46 @@ mod tests {
     
     
     use crate::adapters::test_support::{single_pk_table_with_collation};
+
+    /// CHECK_CLAUSE exactly as MySQL 8.0/8.4 return it (captured via HEX()).
+    fn server_clause(hex: &str) -> String {
+        String::from_utf8((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()).unwrap()
+    }
+
+    #[test]
+    fn mysql_check_clause_undoes_information_schema_escaping_and_double_encoding() {
+        let cases = [
+            ("2860786020696E20285F757466386D62345C277072696E6369706C655C272C5F757466386D62345C2767756964656C696E655C272929", "(`x` in (_utf8mb4'principle',_utf8mb4'guideline'))"),
+            ("28607860203C3E205F757466386D62345C2769745C5C5C27735C2729", r"(`x` <> _utf8mb4'it\'s')"),
+            ("28607860203C3E205F757466386D62345C27615C5C5C5C625C2729", r"(`x` <> _utf8mb4'a\\b')"),
+            ("28607860203C3E205F757466386D62345C2773617920226869225C2729", r#"(`x` <> _utf8mb4'say "hi"')"#),
+            ("28607860203C3E205F757466386D62345C276C696E655C5C6E627265616B5C2729", r"(`x` <> _utf8mb4'line\nbreak')"),
+            ("28607860203C3E205F757466386D62345C27C3ADC295C29CC3AAC2B8C2805C2729", "(`x` <> _utf8mb4'한글')"),
+            ("286E6F742828607860206C696B65205F757466386D62345C2761255C5C5C5C5F625C27292929", r"(not((`x` like _utf8mb4'a%\\_b')))"),
+            ("28607860203C3E205F757466386D62345C275C2729", "(`x` <> _utf8mb4'')"),
+            // SHOW CREATE TABLE prints this emoji as '????'; the decoded clause keeps it.
+            ("28607960206E6F7420696E20285F757466386D62345C27C3B0C29FC298C2805C272C5F757466386D62345C27C384C281C384C28DC382C2A55C272929", "(`y` not in (_utf8mb4'😀',_utf8mb4'āč¥'))"),
+            ("28607860203C3E20636F6E76657274285F757466386D62345C27C383C2A95C27207573696E67206C6174696E312929", "(`x` <> convert(_utf8mb4'é' using latin1))"),
+            ("28607960203C3E2030783030666629", "(`y` <> 0x00ff)"),
+            ("6A736F6E5F76616C696428606A6029", "json_valid(`j`)"),
+        ];
+        for (hex, expected) in cases {
+            let raw = server_clause(hex);
+            let clause = mysql_check_clause(&raw).unwrap();
+            assert_eq!(clause, expected);
+            assert!(is_safe_check_expression(&clause), "{clause}");
+        }
+        // The raw string-literal form is what used to be refused as lossy.
+        assert!(!is_safe_check_expression(&server_clause(cases[0].0)));
+    }
+
+    #[test]
+    fn mysql_check_clause_fails_closed_on_undecodable_input() {
+        // `_latin1 X'E9'` widens to a lone 0xE9 byte: not UTF-8 (SHOW CREATE TABLE prints '?').
+        assert_eq!(mysql_check_clause(&server_clause("28607860203C3E205F6C6174696E315C27C3A95C2729")), None);
+        assert_eq!(mysql_check_clause("(`x` > 0)\\"), None);
+        assert_eq!(mysql_check_clause("(`x` <> _utf8mb4\\'\u{d55c}\\')"), None);
+    }
 
     #[test]
     fn normalized_schema_diff_reports_table_collation_mismatch() {

@@ -116,6 +116,8 @@ fn unsupported_schema_features_are_rejected_before_export() {
         for (ddl,marker) in [
             ("CREATE TABLE sample (id int, doubled int GENERATED ALWAYS AS (id*2) STORED)","generated_column:sample:doubled"),
             ("CREATE TABLE sample (id int, token varchar(40) DEFAULT (lower(uuid())))","unsupported_default:sample:token"),
+            // information_schema renders this literal as a lone 0xE9 byte (SHOW CREATE TABLE: '?').
+            ("CREATE TABLE sample (id int, code varchar(10) CHARACTER SET latin1, CONSTRAINT latin1_code CHECK (code <> _latin1 X'E9'))","check_constraint:sample:latin1_code"),
         ] {
             conn.query_drop(ddl).unwrap(); assert_export_rejected(&endpoint,marker); conn.query_drop("DROP TABLE sample").unwrap();
         }
@@ -199,6 +201,32 @@ fn mysql_checks_uuid_visibility_comments_and_allocator_survive_restore() {
     let column_comment:String=conn.query_first("SELECT COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sample' AND COLUMN_NAME='quantity'").unwrap().unwrap(); assert_eq!(column_comment,"column 'note' 한글");
     let enforced:Vec<(String,String)>=conn.query("SELECT CONSTRAINT_NAME,ENFORCED FROM information_schema.table_constraints WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sample' AND CONSTRAINT_TYPE='CHECK' ORDER BY CONSTRAINT_NAME").unwrap();
     assert_eq!(enforced,vec![("optional_limit".into(),"NO".into()),("positive_quantity".into(),"YES".into())]);
+    conn.query_drop(format!("DROP DATABASE {from}")).unwrap(); conn.query_drop(format!("DROP DATABASE {to}")).unwrap();
+}
+
+#[test]
+fn mysql_string_literal_checks_survive_restore() {
+    let _guard = LIVE_SCHEMA_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut source) = endpoint("mysql") else { return; };
+    let opts = mysql::OptsBuilder::new().ip_or_hostname(Some(source.host.clone())).user(Some(source.user.clone())).pass(Some(source.password.clone()))
+        .pool_opts(mysql::PoolOpts::default().with_constraints(mysql::PoolConstraints::new(0,1).unwrap()));
+    let mut conn=mysql::Pool::new(opts).unwrap().get_conn().unwrap();
+    let from=unique_name(); let to=format!("{from}_dst");
+    conn.query_drop(format!("CREATE DATABASE {from}")).unwrap(); conn.query_drop(format!("CREATE DATABASE {to}")).unwrap(); conn.query_drop(format!("USE {from}")).unwrap();
+    source.database=from.clone(); let mut target=source.clone(); target.database=to.clone();
+    // information_schema escapes these quotes and double-encodes the non-ASCII bytes.
+    conn.query_drop(r#"CREATE TABLE sample(id int PRIMARY KEY, kind varchar(20) NOT NULL, note varchar(40), CONSTRAINT ck_kind CHECK (kind IN ('principle','guideline')), CONSTRAINT ck_note CHECK (note NOT IN ('it''s','a\\b','say "hi"','line\nbreak','한글','😀')), CONSTRAINT ck_like CHECK (note NOT LIKE 'x%\_y'))"#).unwrap();
+    conn.query_drop("INSERT INTO sample VALUES (1,'principle','ok')").unwrap();
+    restore(&source,&target);
+    let clauses = |conn: &mut mysql::PooledConn, database: &str| -> Vec<(String,String)> {
+        conn.exec("SELECT CONSTRAINT_NAME,HEX(CHECK_CLAUSE) FROM information_schema.check_constraints WHERE CONSTRAINT_SCHEMA=? ORDER BY CONSTRAINT_NAME",(database,)).unwrap()
+    };
+    let restored=clauses(&mut conn,&to); assert_eq!(restored.len(),3); assert_eq!(restored,clauses(&mut conn,&from));
+    conn.query_drop(format!("USE {to}")).unwrap();
+    for row in ["(2,'other','ok')","(2,'guideline','it''s')","(2,'guideline','a\\\\b')","(2,'guideline','say \"hi\"')","(2,'guideline','line\\nbreak')","(2,'guideline','한글')","(2,'guideline','😀')","(2,'guideline','x1_y')"] {
+        assert!(conn.query_drop(format!("INSERT INTO sample VALUES {row}")).is_err(), "{row} must violate a restored CHECK");
+    }
+    conn.query_drop("INSERT INTO sample VALUES (2,'guideline','x1y')").unwrap();
     conn.query_drop(format!("DROP DATABASE {from}")).unwrap(); conn.query_drop(format!("DROP DATABASE {to}")).unwrap();
 }
 
